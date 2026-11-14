@@ -400,7 +400,7 @@ a51gpu_jobs(vm_offset_t mali, uint32_t steps)
 #define MALI_PTE_XN             (3ull << 53)
 #define MALI_VA_START           (32ull << 20)   /* Mesa: "lower 32MB are reserved, and the address space is 32-bit" */
 #define MALI_VA_END             (4ull << 30)
-#define MALI_QUEUE              64
+#define MALI_QUEUE              256             /* a window server's frame is a few chains; it may run ahead by a few frames */
 #define MALI_JOB_TIMEOUT_MS     2000
 #define PANFROST_JD_REQ_FS      1u
 
@@ -455,6 +455,7 @@ static bool mali_irq_seen[3];
 static uint32_t mali_resets, mali_heap_faults;
 /* the last troubles, said again in the status line (the kernel log of a whole system's start does not keep them) */
 static char mali_trouble[4][200];
+static char mali_clock_state[240];             /* what the clock steps found (below) */
 static uint32_t mali_trouble_count;
 
 static void
@@ -1079,6 +1080,9 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 			    mali_failed, mali_queue_count, gic_v3_spi_count(IRQ_GPU), gic_v3_spi_count(IRQ_JOB),
 			    gic_v3_spi_count(IRQ_MMU), attached[0], attached[1], attached[2], mali_heap_faults, mali_resets,
 			    HakiosMaliSelfTest());
+			if (mali_clock_state[0]) {
+				printf("a51gpu: clock: %s\n", mali_clock_state);
+			}
 			for (uint32_t t = mali_trouble_count > 4 ? mali_trouble_count - 4 : 0; t < mali_trouble_count; t++) {
 				printf("a51gpu: trouble %u of %u: %s\n", t + 1, mali_trouble_count, mali_trouble[t % 4]);
 			}
@@ -1181,6 +1185,325 @@ mali_keep(vm_offset_t mali)
 	thread_call_enter_delayed(mali_call, deadline);
 }
 
+/* ---- the GPU's clock, through Samsung's ACPM (a51gpu_clock=N) ---------------------------------------------------- */
+
+/*
+ * The Mali's speed is not set here but by ACPM, the power management firmware in the SoC's APM core (a Cortex-M),
+ * which sets the PLL and the GPU's supply voltage together. Its DVFS code is a plugin that the kernel uploads into the
+ * APM's SRAM and attaches at every start (Android's log: "Loading exynos9610_acpm_fvp.fw ... plugin(id = 2) attach
+ * done!"); without it nobody answers on the DVFS channel. Samsung: drivers/soc/samsung/acpm/acpm.c (plugins_init,
+ * handle_dynamic_plugin), acpm_ipc.c, cal-if/acpm_dvfs.c; copies in ~/Desktop/ios-a51/ref/acpm.
+ *   dt: acpm_ipc reg 0x11900000 (mailbox) and 0x2039000 (SRAM), initdata-base 0x6f00; acpm channel 4 (the framework:
+ *       plugin attach), acpm_dvfs channel 5; mali g3d_cmu_cal_id 0xb040004 (ACPM domain 4), levels 260..1053 MHz
+ *   SRAM + initdata: struct acpm_framework: plugins at word 0, num_plugins word 1, ipc_channels word 2, ipc_ap_max word 6
+ *   struct plugin (48 bytes): id, base_addr, acpm_ops, plugin_ops, secure/extern masks, timer (2 words),
+ *       is_attached (byte, at 32), size (36), stay_attached (byte, at 40), fw_name (an SRAM offset, at 44)
+ *   a plugin to attach (stay_attached, not is_attached): its file copied to SRAM + (base_addr & ~1), then on channel 4
+ *       { 1 << 25 (attach) | id << 26 } -- the file from fw/ of the small image (userland/build.sh, from ../fw-acpm)
+ *   a DVFS request on channel 5: { domain, rate in kHz, FREQ_REQ 0 / FREQ_GET 1, 0 }
+ * Steps (a51gpu_clock=N), in a thread of their own that waits for the small image; what they find is said again with the
+ * kept GPU's status line (a whole system's start pushes it out of the kernel log):
+ *   1  reads   the plugin table and the DVFS channel
+ *   2  uploads and attaches the plugins Android attaches, then asks the GPU's present speed (FREQ_GET)
+ *   3  asks    for a51gpu_mhz (default 572), one of the DT's levels, and reads PLL_G3D after
+ */
+#define ACPM_MBOX_PHYS          0x11900000UL
+#define ACPM_SRAM_PHYS          0x02039000UL
+#define ACPM_SRAM_SIZE          0x15000
+#define ACPM_INITDATA           0x6f00
+#define ACPM_FRAMEWORK_CHANNEL  4
+#define ACPM_DVFS_CHANNEL       5
+#define ACPM_G3D_DOMAIN         4
+#define ACPM_INTGR0             0x0008
+#define ACPM_INTSR1             0x0028
+#define ACPM_INTCR1             0x0020
+#define ACPM_FREQ_REQ           0
+#define ACPM_FREQ_GET           1
+#define ACPM_ATTACH             (1u << 25)
+#define ACPM_PLUGIN_SIZE        48
+
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern void IOSleep(unsigned int milliseconds);
+
+static const uint32_t g3d_levels_khz[] = { 1053000, 950000, 840000, 764000, 683000, 572000, 546000, 455000, 384000,
+	                                   338000, 260000 };    /* dt: gpu_dvfs_table, first column */
+
+struct acpm_channel {
+	uint32_t id, field, owner, type;
+	uint32_t rx_rear, rx_front, rx_base, rx_indr_buf, rx_indr_buf_base, rx_indr_buf_size;
+	uint32_t tx_rear, tx_front, tx_base, q_len, q_elem_size, credit, mbox_addr, ap_poll;
+};
+
+static vm_offset_t acpm_sram, acpm_mbox, acpm_cmu;
+static uint32_t acpm_seq, acpm_steps, acpm_mhz = 572;
+static char mali_clock_state[240];             /* said with the status line (declared above too) */
+
+static void
+clock_said(const char *format, ...) __printflike(1, 2);
+
+static void
+clock_said(const char *format, ...)
+{
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(mali_clock_state, sizeof(mali_clock_state), format, ap);
+	va_end(ap);
+	printf("a51gpu: clock: %s\n", mali_clock_state);
+}
+
+static bool
+acpm_channel_read(uint32_t index, struct acpm_channel *ch)
+{
+	uint32_t channels = rd(acpm_sram + ACPM_INITDATA + 2 * 4), ap_max = rd(acpm_sram + ACPM_INITDATA + 6 * 4);
+
+	if (index >= ap_max || channels == 0 || channels + (index + 1) * sizeof(*ch) > ACPM_SRAM_SIZE) {
+		return false;
+	}
+	for (uint32_t w = 0; w < sizeof(*ch) / 4; w++) {
+		((uint32_t *)ch)[w] = rd(acpm_sram + channels + index * sizeof(*ch) + w * 4);
+	}
+	return ch->q_len != 0 && ch->q_len <= 64 && ch->q_elem_size >= 16 && ch->q_elem_size <= 64 &&
+	       ch->rx_base < ACPM_SRAM_SIZE && ch->tx_base < ACPM_SRAM_SIZE && ch->id <= 15;
+}
+
+/*
+ * One request and its answer on a channel (cmd: 4 words in, the answer's 4 words back). The AP sends through the APM's
+ * rx queue and reads answers from its tx queue; a queue of one element has indices that are always 0, and there the
+ * doorbell alone says a request is there and INTSR1 alone that the answer is. false: no room, or no answer in 100 ms.
+ */
+static bool
+acpm_call(const struct acpm_channel *ch, uint32_t cmd[4])
+{
+	bool single = ch->q_len == 1;
+	uint32_t front = rd(acpm_sram + ch->rx_front), next = (front + 1) % ch->q_len, seq;
+
+	if (!single && next == rd(acpm_sram + ch->rx_rear)) {
+		printf("a51gpu: ACPM: channel %u's queue is full\n", ch->id);
+		return false;
+	}
+	if (rd(acpm_mbox + ACPM_INTSR1) & (1u << ch->id) && single) {
+		wr(acpm_mbox + ACPM_INTCR1, 1u << ch->id);      /* (an old answer nobody took) */
+	}
+	seq = acpm_seq = acpm_seq % 63 + 1;
+	cmd[0] = (cmd[0] & ~(0x3fu << 16)) | seq << 16;
+	for (uint32_t w = 0; w < 4; w++) {
+		wr(acpm_sram + ch->rx_base + ch->q_elem_size * front + w * 4, cmd[w]);
+	}
+	__asm__ volatile ("dsb sy");
+	wr(acpm_sram + ch->rx_front, next);
+	wr(acpm_mbox + ACPM_INTGR0, (1u << ch->id) << 16);
+	for (uint32_t i = 0; i < 100000; i++) {
+		if (single) {
+			if (!(rd(acpm_mbox + ACPM_INTSR1) & (1u << ch->id))) {
+				delay(1);
+				continue;
+			}
+			for (uint32_t w = 0; w < 4; w++) {
+				cmd[w] = rd(acpm_sram + ch->tx_base + w * 4);
+			}
+			wr(acpm_mbox + ACPM_INTCR1, 1u << ch->id);
+			return true;
+		}
+		uint32_t rear = rd(acpm_sram + ch->tx_rear), tfront = rd(acpm_sram + ch->tx_front);
+		for (uint32_t at = rear; at != tfront; at = (at + 1) % ch->q_len) {
+			vm_offset_t e = acpm_sram + ch->tx_base + ch->q_elem_size * at;
+
+			if (((rd(e) >> 16) & 0x3f) != seq) {
+				continue;
+			}
+			for (uint32_t w = 0; w < 4; w++) {
+				cmd[w] = rd(e + w * 4);
+			}
+			if (at != rear) {               /* (Samsung's way: the answer's place filled with the oldest, then that one dropped) */
+				for (uint32_t w = 0; w < ch->q_elem_size / 4; w++) {
+					wr(e + w * 4, rd(acpm_sram + ch->tx_base + ch->q_elem_size * rear + w * 4));
+				}
+			}
+			rear = (rear + 1) % ch->q_len;
+			wr(acpm_sram + ch->tx_rear, rear);
+			if (rear == rd(acpm_sram + ch->tx_front)) {
+				wr(acpm_mbox + ACPM_INTCR1, 1u << ch->id);
+			}
+			return true;
+		}
+		delay(1);
+	}
+	printf("a51gpu: ACPM: no answer on channel %u in 100 ms (INTSR1 %x, tx rear %u front %u)\n", ch->id,
+	    rd(acpm_mbox + ACPM_INTSR1), rd(acpm_sram + ch->tx_rear), rd(acpm_sram + ch->tx_front));
+	return false;
+}
+
+/* A string of the APM's SRAM (a plugin's file name), copied out; "" when there is none. */
+static void
+sram_string(uint32_t offset, char *out, size_t size)
+{
+	size_t i = 0;
+
+	for (; offset != 0 && offset < ACPM_SRAM_SIZE && i + 1 < size; i++, offset++) {
+		char c = (char)((rd(acpm_sram + (offset & ~3u)) >> (8 * (offset & 3))) & 0xff);
+
+		if (c == 0) {
+			break;
+		}
+		out[i] = c;
+	}
+	out[i] = 0;
+}
+
+static void
+clock_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	struct acpm_channel framework, dvfs;
+	uint32_t plugins = rd(acpm_sram + ACPM_INITDATA), count = rd(acpm_sram + ACPM_INITDATA + 4), cmd[4];
+	uint32_t attached = 0, wanted = 0;
+	char name[48];
+
+	printf("a51gpu: clock step 1: ACPM's plugins (%u at SRAM %x) and channels\n", count, plugins);
+	if (count == 0 || count > 16 || plugins == 0 || plugins + count * ACPM_PLUGIN_SIZE > ACPM_SRAM_SIZE) {
+		clock_said("the plugin table is not what was expected (%u at %x)", count, plugins);
+		return;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		vm_offset_t p = acpm_sram + plugins + i * ACPM_PLUGIN_SIZE;
+		uint32_t is = rd(p + 32) & 0xff, stay = rd(p + 40) & 0xff;
+
+		sram_string(rd(p + 44), name, sizeof(name));
+		printf("a51gpu: ACPM plugin %u: id %u base %x size %x attached %u stay %u file \"%s\" (raw %x %x %x %x)\n", i,
+		    rd(p), rd(p + 4), rd(p + 36), is, stay, name, rd(p + 32), rd(p + 36), rd(p + 40), rd(p + 44));
+		if (is && stay) {
+			attached |= 1u << rd(p);
+		}
+		if (!is && stay) {
+			wanted |= 1u << rd(p);
+		}
+	}
+	if (!acpm_channel_read(ACPM_FRAMEWORK_CHANNEL, &framework) || !acpm_channel_read(ACPM_DVFS_CHANNEL, &dvfs)) {
+		clock_said("the ACPM channels are not what was expected");
+		return;
+	}
+	clock_said("step 1: plugins attached %x, to attach %x; GPU PLL con0 %x", attached, wanted, rd(acpm_cmu + PLL_CON0_PLL_G3D));
+	if (acpm_steps < 2) {
+		return;
+	}
+
+	/* step 2: the plugins Android attaches, from fw/ of the small image (waited for: it comes with the system's start) */
+	for (uint32_t i = 0; i < count; i++) {
+		vm_offset_t p = acpm_sram + plugins + i * ACPM_PLUGIN_SIZE;
+		uint32_t id = rd(p), base = rd(p + 4) & ~1u;
+		const uint8_t *file = NULL;
+		uint64_t size = 0;
+
+		if ((rd(p + 32) & 0xff) || !(rd(p + 40) & 0xff)) {
+			continue;
+		}
+		sram_string(rd(p + 44), name, sizeof(name));
+		for (int t = 0; t < 240 && name[0] && (file = hakios_image_file("fw", name, &size, NULL)) == NULL; t++) {
+			IOSleep(500);
+		}
+		if (file == NULL || size == 0 || base == 0 || base + size > ACPM_SRAM_SIZE) {
+			clock_said("step 2: plugin %u's file fw/%s not found or does not fit (%llu bytes at %x)", id, name, size, base);
+			return;
+		}
+		for (uint64_t off = 0; off + 4 <= size; off += 4) {
+			wr(acpm_sram + base + off, (uint32_t)file[off] | (uint32_t)file[off + 1] << 8 |
+			    (uint32_t)file[off + 2] << 16 | (uint32_t)file[off + 3] << 24);
+		}
+		__asm__ volatile ("dsb sy");
+		cmd[0] = ACPM_ATTACH | id << 26;
+		cmd[1] = cmd[2] = cmd[3] = 0;
+		bool answered = acpm_call(&framework, cmd);
+		printf("a51gpu: ACPM: plugin %u (%s, %llu bytes at %x) %s (answer %x %x %x %x); attached now %u\n", id, name,
+		    size, base, answered ? "attached" : "NOT ANSWERED", cmd[0], cmd[1], cmd[2], cmd[3], rd(p + 32) & 0xff);
+		if (!answered) {
+			clock_said("step 2: plugin %u (%s) not attached: no answer", id, name);
+			return;
+		}
+	}
+	/* the DVFS plugin owns its channel: what it looks like now that the plugin runs (it was a placeholder before) */
+	struct acpm_channel before = dvfs;
+	if (!acpm_channel_read(ACPM_DVFS_CHANNEL, &dvfs)) {
+		clock_said("step 2: plugins attached; the DVFS channel is not what was expected now");
+		return;
+	}
+	char layout[120];
+	snprintf(layout, sizeof(layout), "DVFS channel: queue %u x %u (was %u x %u), type %u poll %u, rx %x/%x/%x tx %x/%x/%x",
+	    dvfs.q_len, dvfs.q_elem_size, before.q_len, before.q_elem_size, dvfs.type, dvfs.ap_poll, dvfs.rx_rear,
+	    dvfs.rx_front, dvfs.rx_base, dvfs.tx_rear, dvfs.tx_front, dvfs.tx_base);
+	printf("a51gpu: ACPM: %s\n", layout);
+	cmd[0] = ACPM_G3D_DOMAIN;
+	cmd[1] = 0;
+	cmd[2] = ACPM_FREQ_GET;
+	cmd[3] = 0;
+	if (!acpm_call(&dvfs, cmd)) {
+		clock_said("step 2: plugins attached, but no answer to FREQ_GET; %s", layout);
+		return;
+	}
+	uint32_t was = cmd[1];
+	clock_said("step 2: plugins attached; the GPU runs at %u kHz (answer %x %x %x %x); PLL con0 %x", was, cmd[0], cmd[1],
+	    cmd[2], cmd[3], rd(acpm_cmu + PLL_CON0_PLL_G3D));
+	if (acpm_steps < 3) {
+		return;
+	}
+
+	uint32_t khz = 0;
+	for (uint32_t i = 0; i < sizeof(g3d_levels_khz) / sizeof(g3d_levels_khz[0]); i++) {
+		if ((g3d_levels_khz[i] + 500) / 1000 == acpm_mhz || g3d_levels_khz[i] / 1000 == acpm_mhz) {
+			khz = g3d_levels_khz[i];
+		}
+	}
+	if (khz == 0) {
+		clock_said("step 3: a51gpu_mhz=%u is not one of the GPU's levels", acpm_mhz);
+		return;
+	}
+	cmd[0] = ACPM_G3D_DOMAIN;
+	cmd[1] = khz;
+	cmd[2] = ACPM_FREQ_REQ;
+	cmd[3] = 0;
+	bool set = acpm_call(&dvfs, cmd);
+	cmd[0] = ACPM_G3D_DOMAIN;
+	cmd[1] = 0;
+	cmd[2] = ACPM_FREQ_GET;
+	cmd[3] = 0;
+	bool got = acpm_call(&dvfs, cmd);
+	clock_said("step 3: %u kHz asked (%s); the GPU runs at %u kHz (was %u); PLL con0 %x", khz,
+	    set ? "answered" : "NO ANSWER", got ? cmd[1] : 0, was, rd(acpm_cmu + PLL_CON0_PLL_G3D));
+}
+
+static thread_call_t clock_call;
+
+static void
+clock_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(clock_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+/* From step 4 on: the mappings now, the steps in a thread one second from now (no threads this early). */
+static void
+a51gpu_clock(vm_offset_t cmu)
+{
+	uint64_t deadline;
+
+	if (!PE_parse_boot_argn("a51gpu_clock", &acpm_steps, sizeof(acpm_steps)) || acpm_steps == 0) {
+		return;
+	}
+	PE_parse_boot_argn("a51gpu_mhz", &acpm_mhz, sizeof(acpm_mhz));
+	acpm_cmu = cmu;
+	acpm_sram = ml_io_map(ACPM_SRAM_PHYS, ACPM_SRAM_SIZE);
+	acpm_mbox = ml_io_map(ACPM_MBOX_PHYS, 0x1000);
+	if (!acpm_sram || !acpm_mbox) {
+		printf("a51gpu: cannot map ACPM's SRAM or mailbox\n");
+		return;
+	}
+	clock_call = thread_call_allocate(clock_start, NULL);
+	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(clock_call, deadline);
+}
+
 static void
 a51gpu_init(void)
 {
@@ -1262,6 +1585,7 @@ a51gpu_init(void)
 	    rd(mali + JS_PRESENT), rd(mali + GPU_STATUS), rd(mali + GPU_IRQ_RAWSTAT));
 	printf("a51gpu: present: shader cores %x, tilers %x, L2 %x\n", rd(mali + SHADER_PRESENT_LO),
 	    rd(mali + TILER_PRESENT_LO), rd(mali + L2_PRESENT_LO));
+	a51gpu_clock(cmu);
 	if (steps < 5) {
 		return;
 	}

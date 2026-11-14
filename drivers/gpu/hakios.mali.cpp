@@ -34,12 +34,17 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOSubMemoryDescriptor.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <mach/mach_time.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+
+#include "MiniIOSurface.h"
+
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 
 extern "C" {
 /* devices/a51/drivers/gpu/hakios.a51gpu.c ("the GPU kept for programs") */
@@ -81,7 +86,10 @@ enum {
 	kPanfrostPerfcntDump    = 0x47,
 	kPanfrostMadvise        = 0x48,
 	kHakiosWaitFence        = 0x7b,         /* ours */
+	kHakiosUserMemory       = 0x7d,         /* ours, as HakiosGPU's: pages of the caller's own as a buffer (Linux's userptr) */
+	kHakiosSurface          = 0x7e,         /* ours, as HakiosGPU's: an IOSurface's memory as a buffer */
 };
+#define kHakiosDescribe         0xffffffffu     /* a surface request that only asks what the buffer would be like */
 #define PANFROST_BO_NOEXEC      1
 #define PANFROST_BO_HEAP        2
 
@@ -120,6 +128,18 @@ struct drm_panfrost_madvise {
 struct drm_gem_close {
 	uint32_t handle, pad;
 };
+struct hakios_user_memory {
+	uint64_t address, size;                 /* in the caller, in whole pages */
+	uint32_t handle;                        /* back: the buffer */
+	uint32_t flags;
+};
+struct hakios_surface {
+	uint32_t surface;                       /* the IOSurface's ID */
+	uint32_t handle;                        /* kHakiosDescribe: no buffer is wanted; else, back: the buffer, */
+	uint64_t size;                          /* how big it is, */
+	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
+	uint32_t width, height, pixelFormat, planes;    /* and what they are */
+};
 struct hakios_wait_fence {
 	uint32_t fence;
 	uint32_t completed;                     /* out: the last fence that is over */
@@ -132,9 +152,15 @@ struct hakios_wait_fence {
 #define MALI_HEAPS              32
 #define MALI_HEAP_CHUNKS        256             /* 512 MB of heap at the most */
 #define MALI_GIVE_BACK_MS       2000            /* how long a buffer given back waits for the GPU to be through with it */
+#define MALI_PUSH_AGAIN_MS      4               /* an unchanged surface is pushed out of the cache again this long after the last */
 
 struct mali_buffer {
-	IOBufferMemoryDescriptor *      memory;         /* NULL for a heap */
+	IOMemoryDescriptor *            memory;         /* NULL for a heap */
+	uint8_t *                       kernel;         /* where an IOSurface's pixels are in the kernel (for the cache) */
+	MiniIOSurface *                 surface;        /* whose memory it is, when not its own (held) */
+	bool                            client;         /* the client's own pages (wired; out of the cache by physical address) */
+	uint32_t                        seed;           /* the surface's when it was last pushed out of the cache, */
+	uint64_t                        pushed;         /* ... and when */
 	uint64_t                        address;        /* the GPU's; 0: this handle is free */
 	uint64_t                        size;
 	uint32_t                        flags;
@@ -238,6 +264,22 @@ deadlineOf(int64_t timeout_ns)
 	}
 	nanoseconds_to_absolutetime((uint64_t) timeout_ns - now_ns, &left);
 	return mach_absolute_time() + left;
+}
+
+/*
+ * The display's driver asks before it shows a surface whether the GPU is through drawing into it (MiniIOMobileFramebuffer:
+ * the last chain that named it, kept in the surface by submit()).
+ */
+bool
+MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
+{
+	uint64_t deadline;
+
+	if (surface->drawn == 0 || !hakios_mali_ready()) {
+		return true;
+	}
+	clock_interval_to_deadline((uint32_t) milliseconds, NSEC_PER_MSEC, &deadline);
+	return hakios_mali_wait(surface->drawn, deadline);
 }
 
 /* ---- the service ---- */
@@ -385,6 +427,7 @@ class HakiosMaliUserClient : public IOUserClient
 {
 	OSDeclareDefaultStructors(HakiosMaliUserClient);
 
+	task_t                  fTask;
 	struct mali_buffer *    fBuffers;               /* handle n is fBuffers[n - 1] */
 	uint32_t                fNextBuffer;
 	uint32_t                fBufferCount;
@@ -395,8 +438,12 @@ class HakiosMaliUserClient : public IOUserClient
 	void freeBuffer(struct mali_buffer * b);
 	IOReturn createBO(struct drm_panfrost_create_bo * request);
 	IOReturn submit(struct drm_panfrost_submit * request);
+	IOReturn surfaceBuffer(struct hakios_surface * request);
+	IOReturn userBuffer(struct hakios_user_memory * request);
+	struct mali_buffer * newHandle(uint32_t * handle);
 
 public:
+	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
@@ -406,6 +453,16 @@ public:
 };
 
 OSDefineMetaClassAndStructors(HakiosMaliUserClient, IOUserClient);
+
+bool
+HakiosMaliUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
+{
+	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
+		return false;
+	}
+	fTask = owningTask;
+	return true;
+}
 
 bool
 HakiosMaliUserClient::start(IOService * provider)
@@ -452,10 +509,163 @@ HakiosMaliUserClient::freeBuffer(struct mali_buffer * b)
 		IOLockUnlock(gHeapLock);
 	}
 	hakios_mali_address_free(b->address, b->size);
+	if (b->client && b->memory != NULL) {
+		b->memory->complete();                  /* (the client's pages unwired) */
+	}
 	OSSafeReleaseNULL(b->memory);
+	if (b->surface != NULL) {
+		MiniIOSurfaceDrop(b->surface);
+	}
 	fBufferCount--;
 	fBufferBytes -= b->size;
 	bzero(b, sizeof(*b));
+}
+
+/* A free handle, its slot cleared. With gMaliLock held; NULL: none left. */
+struct mali_buffer *
+HakiosMaliUserClient::newHandle(uint32_t * handle)
+{
+	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
+		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
+
+		if (fBuffers[i].address == 0) {
+			bzero(&fBuffers[i], sizeof(fBuffers[i]));
+			fBuffers[i].heap = -1;
+			*handle = i + 1;
+			fNextBuffer = i + 1;
+			return &fBuffers[i];
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The memory of an IOSurface as a buffer: its pixels, from the page after the surface's shared state on (MiniIOSurface.h),
+ * held for as long as the buffer is there. A surface that is a buffer of this client's already is that buffer again, as
+ * with Linux's handles. Asked only to describe (kHakiosDescribe), no buffer is made. As HakiosGPU's surfaceBuffer().
+ */
+IOReturn
+HakiosMaliUserClient::surfaceBuffer(struct hakios_surface * request)
+{
+	MiniIOSurface * s = MiniIOSurfaceCopy(request->surface);
+	struct mali_buffer * b = NULL;
+	IOMemoryDescriptor * memory;
+	uint64_t size;
+
+	if (s == NULL) {
+		return kIOReturnNotFound;
+	}
+	if (s->client != NULL) {
+		MiniIOSurfaceDrop(s);                   /* (memory of a program's own with a surface made around it: not whole pages) */
+		return kIOReturnUnsupported;
+	}
+	size = round_page_64(s->info.allocSize);
+	memory = IOSubMemoryDescriptor::withSubRange(s->memory, PAGE_SIZE, size, kIODirectionInOut);
+	if (memory == NULL || size == 0 || size > MALI_BUFFER_MAX) {
+		OSSafeReleaseNULL(memory);
+		MiniIOSurfaceDrop(s);
+		return kIOReturnNoMemory;
+	}
+	request->size = size;
+	request->offset = s->info.offset;
+	request->rowBytes = s->info.bytesPerRow;
+	request->width = s->info.width;
+	request->height = s->info.height;
+	request->pixelFormat = s->info.pixelFormat;
+	request->planes = s->info.planeCount;
+	if (request->handle == kHakiosDescribe) {
+		request->handle = 0;
+		memory->release();
+		MiniIOSurfaceDrop(s);
+		return kIOReturnSuccess;
+	}
+	IOLockLock(gMaliLock);
+	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
+		if (fBuffers[i].address != 0 && fBuffers[i].surface == s) {
+			request->handle = i + 1;
+			IOLockUnlock(gMaliLock);
+			memory->release();
+			MiniIOSurfaceDrop(s);
+			return kIOReturnSuccess;
+		}
+	}
+	b = newHandle(&request->handle);
+	if (b != NULL && (b->address = hakios_mali_address(size, 64 << 10, false)) != 0 && enter(memory, b->address, size, true)) {
+		b->memory = memory;
+		b->kernel = s->kbase + PAGE_SIZE;
+		b->surface = s;
+		b->size = size;
+		fBufferCount++;
+		fBufferBytes += size;
+		IOLockUnlock(gMaliLock);
+		return kIOReturnSuccess;
+	}
+	if (b != NULL && b->address != 0) {
+		hakios_mali_unmap(b->address, size);
+		hakios_mali_address_free(b->address, size);
+	}
+	if (b != NULL) {
+		bzero(b, sizeof(*b));
+	}
+	IOLockUnlock(gMaliLock);
+	memory->release();
+	MiniIOSurfaceDrop(s);
+	return kIOReturnNoMemory;
+}
+
+/*
+ * Pages of the client's own as a buffer, as Linux's userptr: wired for as long as the buffer is there and pushed out of
+ * this processor's cache at every submission that names them (they are ordinary memory). As HakiosGPU's userBuffer().
+ */
+IOReturn
+HakiosMaliUserClient::userBuffer(struct hakios_user_memory * request)
+{
+	IOMemoryDescriptor * memory = NULL;
+	IOReturn prepared = kIOReturnNoMemory;
+	struct mali_buffer * b;
+
+	if ((request->address & PAGE_MASK) || (request->size & PAGE_MASK) || request->size == 0 ||
+	    request->size > MALI_BUFFER_MAX) {
+		return kIOReturnBadArgument;
+	}
+	for (int pass = 0; pass < 2 && prepared != kIOReturnSuccess; pass++) {
+		/* (pages the client may only read: the GPU too reads them only -- the second try) */
+		memory = IOMemoryDescriptor::withAddressRange(request->address, request->size,
+		    pass == 0 ? kIODirectionInOut : kIODirectionOut, fTask);
+		if (memory == NULL) {
+			return kIOReturnNoMemory;
+		}
+		prepared = memory->prepare();
+		if (prepared != kIOReturnSuccess) {
+			OSSafeReleaseNULL(memory);
+		}
+	}
+	if (memory == NULL) {
+		return kIOReturnVMError;
+	}
+	IOLockLock(gMaliLock);
+	b = newHandle(&request->handle);
+	if (b != NULL && (b->address = hakios_mali_address(request->size, 64 << 10, false)) != 0 &&
+	    enter(memory, b->address, request->size, true)) {
+		b->memory = memory;
+		b->client = true;
+		b->size = request->size;
+		fBufferCount++;
+		fBufferBytes += request->size;
+		IOLockUnlock(gMaliLock);
+		return kIOReturnSuccess;
+	}
+	if (b != NULL && b->address != 0) {
+		hakios_mali_unmap(b->address, request->size);
+		hakios_mali_address_free(b->address, request->size);
+	}
+	if (b != NULL) {
+		bzero(b, sizeof(*b));
+	}
+	IOLockUnlock(gMaliLock);
+	memory->complete();
+	memory->release();
+	return kIOReturnNoMemory;
 }
 
 IOReturn
@@ -471,21 +681,11 @@ HakiosMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
 		return kIOReturnBadArgument;            /* (Linux too: a heap must be NOEXEC) */
 	}
 	IOLockLock(gMaliLock);
-	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
-		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
-
-		if (fBuffers[i].address == 0) {
-			b = &fBuffers[i];
-			handle = i + 1;
-			fNextBuffer = i + 1;
-			break;
-		}
-	}
+	b = newHandle(&handle);
 	if (b == NULL) {
 		IOLockUnlock(gMaliLock);
 		return kIOReturnNoMemory;
 	}
-	b->heap = -1;
 	b->address = hakios_mali_address(size, heap || size >= MALI_HEAP_CHUNK ? MALI_HEAP_CHUNK : 4096, !noexec);
 	if (b->address == 0) {
 		IOLog("HakiosMali: no GPU addresses left for %llu bytes\n", size);
@@ -539,12 +739,69 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 		return kIOReturnBadArgument;
 	}
 	IOLockLock(gMaliLock);
-	fence = hakios_mali_submit(request->jc, request->requirements);
+	/*
+	 * The GPU reads and writes memory, not this processor's cache. What the cache holds of an IOSurface goes out of it
+	 * now: when the surface is said to have changed (its seed), and in any case once in a few milliseconds (not everybody
+	 * who draws into a surface says so); the client's own pages, every time. Buffers made here are write-combined and
+	 * need nothing. As HakiosGPU's submit().
+	 */
+	uint64_t now_abs = mach_absolute_time(), again;
+	nanoseconds_to_absolutetime(MALI_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
+	for (uint32_t done = 0; done < count;) {
+		uint32_t now = count - done > 256 ? 256 : count - done;
+
+		if (copyin((user_addr_t)(request->bo_handles + done * sizeof(uint32_t)), handles, now * sizeof(uint32_t)) != 0) {
+			break;
+		}
+		for (uint32_t i = 0; i < now; i++) {
+			struct mali_buffer * b = buffer(handles[i]);
+
+			if (b == NULL) {
+				continue;
+			}
+			if (b->surface != NULL) {
+				uint32_t seed = b->surface->shared()->seed;
+
+				if (seed != b->seed || now_abs - b->pushed >= again) {
+					b->seed = seed;
+					b->pushed = now_abs;
+					flush_dcache64((addr64_t)(uintptr_t) b->kernel, (unsigned) b->size, FALSE);
+				}
+			} else if (b->client) {
+				for (uint64_t offset = 0; offset < b->size;) {
+					IOByteCount length = 0;
+					addr64_t phys = b->memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
+
+					if (phys == 0 || length == 0) {
+						break;
+					}
+					length = MIN(length, b->size - offset);
+					flush_dcache64(phys, (unsigned) length, TRUE);
+					offset += length;
+				}
+			}
+		}
+		done += now;
+	}
+	__asm__ volatile ("dsb sy");
+	/*
+	 * A full queue is waited out here: Mesa does not try a refused submission again (panfrost_batch_submit failed: 16,
+	 * and that batch's drawing is lost). Room comes as chains end; five seconds at the most.
+	 */
+	for (int tries = 0; (fence = hakios_mali_submit(request->jc, request->requirements)) == 0 && tries < 50; tries++) {
+		uint64_t deadline;
+
+		IOLockUnlock(gMaliLock);
+		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+		hakios_mali_wait(hakios_mali_completed() + 1, deadline);
+		IOLockLock(gMaliLock);
+	}
 	if (fence == 0) {
 		IOLockUnlock(gMaliLock);
-		return kIOReturnBusy;                   /* the queue is full: Mesa waits and tries again */
+		IOLog("HakiosMali: the queue stays full: a submission refused\n");
+		return kIOReturnBusy;
 	}
-	/* every buffer it names is the GPU's until this chain is over */
+	/* every buffer it names is the GPU's until this chain is over; a surface remembers it for the display (MiniIOSurfaceDrawn) */
 	for (uint32_t done = 0; done < count;) {
 		uint32_t now = count - done > 256 ? 256 : count - done;
 
@@ -556,6 +813,9 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 
 			if (b != NULL) {
 				b->fence = fence;
+				if (b->surface != NULL) {
+					b->surface->drawn = fence;
+				}
 			}
 		}
 		done += now;
@@ -626,6 +886,8 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		struct drm_panfrost_madvise madvise;
 		struct drm_gem_close close;
 		struct hakios_wait_fence waitFence;
+		struct hakios_surface surface;
+		struct hakios_user_memory user;
 	} r;
 	size_t size = args->structureInputSize;
 	struct mali_buffer * b;
@@ -700,6 +962,12 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 		if (ret == kIOReturnTimeout) {
 			ret = kIOReturnSuccess;         /* (the caller compares `completed`; a timeout is not an error here) */
 		}
+		break;
+	case kHakiosSurface:
+		ret = surfaceBuffer(&r.surface);
+		break;
+	case kHakiosUserMemory:
+		ret = userBuffer(&r.user);
 		break;
 	case kPanfrostPerfcntEnable:
 	case kPanfrostPerfcntDump:

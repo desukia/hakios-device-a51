@@ -309,3 +309,68 @@ triangle's corners read 235 12 8 / 12 235 8 / 10 10 235; 26% of the pixels are i
 geometry gives. GPU: 6 jobs, 0 failed, no resets, heap grown twice. So the earlier failed jobs were the same stale-mapping
 bug. Not yet: putting a GL picture on the panel (gl_test needs a GPU service with the surface/show requests, which
 HakiosMali lacks) and the window server drawing with GL (userland GL=1, src/inject.c, which only knows the Adreno).
+
+### The window server on GL (written, built, not yet run; 2026-11-14)
+
+- HakiosMali: IOSurface buffers (0x7e, with describe) and buffers of a client's own pages (0x7d), as HakiosGPU has them.
+  At each SUBMIT it flushes the named surfaces from the CPU cache (when the seed changed, or after 4 ms) and the
+  client's own pages (always), and records each surface's fence in surface->drawn. It also provides
+  MiniIOSurfaceDrawn(), so the display waits for the GPU before showing a surface (the stub in
+  drivers/core/hakios.stubs.cpp steps aside for HAKIOS_A51GPU too).
+- Mesa: tools/mesa/zz-panfrost-surfaces.patch (OSMesa's surface hook for Panfrost too; Panfrost's import asks the
+  size through hakios_drm_import_size() instead of lseek() on the surface ID).
+- userland/src/inject.c: HakiosMali counts as a GPU, so CoreAnimation loads libhakios.gl and draws with OpenGL ES.
+- Build: `GL=1 CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh`; run: `./a51-ios.sh 600 touchscreen=1 a51gpu=8 a51gpu_keep=1`.
+
+#### The window server draws on the Mali (2026-11-14)
+
+First GL=1 run: "the server has an accelerated renderer". The home screen (wallpaper, widgets, icons) and Control Center
+are drawn through Mesa Panfrost on the Mali: 38515 GPU jobs in 600 s, 0 failed, 0 resets. Frames average about 30 ms
+(about 33 fps). Per frame that is about 4.2 ms waiting for the GPU, 2.6 ms making textures from IOSurfaces and 0.3 ms
+handing commands on; the rest is CPU time in the window server. 1171 IOSurfaces were copied rather than shared (surfaces
+around a program's own memory, which HakiosGPU doesn't share either).
+Bug: 232 × "MESA: error: panfrost_batch_submit failed: 16". HakiosMali returned EBUSY when its 64-entry queue was
+full, and Mesa drops a refused batch. Fixed (built, not yet run): SUBMIT waits for room (up to 5 s) and the queue holds
+256 chains.
+The GPU still runs at 260 MHz (PLL_G3D a0a00412; the DT allows up to 1053 MHz): DVFS through ACPM is next.
+
+Queue fix run (2026-11-14): 0 × "panfrost_batch_submit failed" (232 before), 44645 jobs, 0 failed, and the window server
+now averages about 22 ms a frame (about 45 fps), about 4 ms of it waiting for the GPU.
+
+### GPU clock through ACPM (written, built, not yet run)
+
+`a51gpu_clock=1` reads ACPM's channel table from the APM's SRAM (0x2039000 + 0x6f00) and sends FREQ_GET for DVFS domain 4
+(g3d_cmu_cal_id 0xb040004) on channel 5. Nothing changes. `a51gpu_clock=2 a51gpu_mhz=N` sends FREQ_REQ for one of the
+DT's levels (260..1053 MHz; default 572) and reads PLL_G3D back. The firmware sets the voltage with the clock, as on
+Android (Samsung acpm_dvfs.c / acpm_ipc.c, copied to ref/acpm/). Test early-boot steps with a51-run.sh, whose log keeps
+them: `EXTRA="a51gpu=4 a51gpu_clock=1" ./a51-run.sh 4 0 clk1 1`.
+
+Clock step 1 on the phone (2026-11-14): the ACPM table reads fine. 6 plugins; 15 channels, 8 for the AP, at SRAM
++0x5ad8, 72 bytes each, exactly Samsung's struct ipc_channel. DVFS channel 5 is id 5, type 2, ap_poll 0, and has a
+**1-element** queue of 16 bytes (AP→APM rear/front/base 0x73a8/0x73ac/0x73b0, APM→AP 0x7388/0x738c/0x7390, indices 0/0).
+Channels 0, 1, 2, 4 and 7 have rings of 15, 3, 3, 3 and 5; channel 3 (type 2) has its queues in the mailbox's SR registers.
+FREQ_GET (domain 4) through the doorbell alone (INTGR0 bit 16+5) got no answer in 50 ms: INTSR1 stayed 0 and the tx
+slot didn't change. Samsung's acpm_ipc_send_data() can't send on a 1-slot ring either: its full test (front+1 mod len ==
+rear) is always true there, and framework.h says the firmware sees a request only by rx_front != rx_rear. So either
+the firmware treats type-2 channels in a way the published source doesn't show, or Android does something else.
+Stopped there rather than poke the APM, which also runs CPU and memory power. Next: ground truth from Android (does GPU
+DVFS work there: /sys/kernel/gpu/gpu_clock, dmesg acpm lines).
+
+Android shows the missing piece (2026-11-14): its kernel uploads ACPM plugins at every boot ("Loading
+exynos9610_acpm_fvp.fw firmware ... plugin(id = 2) attach done!", tmu as id 4; "dvfs_g3d - id : 4"), and Android's GPU
+DVFS works (/sys/kernel/gpu: 11 levels, Interactive governor). The plugin files are built into Samsung's kernel image
+(its firmware/ directory, 5120 bytes each). They're in fw-acpm/ (not in git), and userland/build.sh puts them in
+root.apfs fw/. Clock steps now run in a thread of their own that waits for the small image; their result repeats with
+the status line ("a51gpu: clock: ..."). Steps: 1 reads the plugin table (48-byte struct plugin) and channels; 2 uploads
+and attaches the plugins Android attaches (channel 4, cmd 1<<25 | id<<26) and sends FREQ_GET; 3 sends FREQ_REQ
+(a51gpu_mhz). Test: `./a51-ios.sh 120 a51gpu=8 a51gpu_keep=1 a51gpu_clock=1`, then =2, then =3.
+
+Clock steps 1 and 2 on the phone (2026-11-14): step 1 found plugins 0, 1, 3 and 5 attached and 2 and 4 to attach (0x2b /
+0x14), exactly the fvp and tmu plugins Android's kernel attaches. Step 2 uploaded both and the firmware answered both
+attaches on channel 4, the first ACPM answers to HakiOS; iOS and the GPU ran normally after. But FREQ_GET on DVFS
+channel 5 still gets no answer, and its descriptor is unchanged after the attach: 1 x 16, type 2, ap_poll 0. All
+channels that answer are type 1 rings; the type-2 ones (3, 5, 6) have one slot (channel 3's in the mailbox's SR
+registers). Samsung's published acpm_ipc.c has no path for a one-slot channel (its full test is always true there),
+so Android must send DVFS requests some way that source doesn't show. Parked. The steps stay behind a51gpu_clock=N.
+Leads: Android's /sys/kernel/debug/acpm_framework, ACPM's own log buffer in SRAM (log_buf_rear/front in acpm_framework),
+or a newer Samsung acpm_ipc.c that handles type-2 channels.
