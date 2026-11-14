@@ -25,6 +25,8 @@ The small image for that, with OpenGL ES on the Mali and the console quiet:
 
     QUIET=1 GL=1 CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh
 
-and the boot-arguments for the GPU and the touch screen: `touchscreen=1 a51gpu=8 a51gpu_keep=1`. Leave `-v` out, and keep
+and the boot-arguments for the GPU, the clocks and the touch screen: `touchscreen=1 a51gpu=8 a51gpu_keep=1 a51gpu_clock=3`
+(a51gpu_clock=3 asks ACPM for the top CPU and GPU speeds and watches the temperature; it needs Samsung's ACPM plugins in
+../fw-acpm when the image is built, see PORTING.md). Leave `-v` out, and keep
 `QUIET=1`: launchd's output and the kernel's text console, drawn into the framebuffer by the CPU line by line, kept about
 a processor busy with the system idle (measured: about 116% of the CPU idle with them, about 15% without).

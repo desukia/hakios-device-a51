@@ -419,3 +419,22 @@ Profile at the raised clocks (a51gpu_clock=3, same quiet GL rc.jobs.cputop build
 ms at the bootloader's clocks (about 18% faster), waiting for the GPU 2.6 ms against 3.5, idle CPU about 11% against 15%,
 and the widgets' start-up storm was over by about 130 s against about 145 s. Stable for the whole 5 minutes: 14704 GPU
 jobs, 0 failed, no resets, no panic.
+
+### Temperature watch (step 1: reading, built, not yet run)
+
+TMU at 0x10070000 (dt BIG/LITTLE/G3D/ISP, one block): sensor 0 GPU (G3D sensors=1), 1 A53s (LITTLE and ISP, 2),
+2 A73s (BIG, 4). Codes in 0x40 (sensors 0, 1) and 0x44 (sensor 2), 9 bits each; TRIMINFO(n) at n*4 (25 °C code bits 0-8,
+85 °C code bits 9-17), two-point if TRIMINFO(0) bit 23; efuse fallback 0x37 (Samsung exynos_tmu.c). The status line now
+says "a51gpu: temperatures: GPU, A53s, A73s" with the raw values. Read only; throttling comes once the readings look right.
+Readings on the phone (5 min at 1638/2080/572 MHz, scripted swipes): 49-53 °C with the home screen just up, peaks of
+GPU 61, A53s 60 and A73s 77 °C during the widgets' start-up, then 50-57 °C. Decoding checked by hand (sensor 0: code
+0x12d, e25 0x114, e85 0x150, two-point: 50 °C). Samsung's limits (dt thermal-zones): big cores passive from 83 °C, active
+95/100/105/110, hot 115; little cores from 81.
+Step 2 (built, not yet run): after step 3, the clock thread watches once a second. Above 83 °C a domain drops one level
+a second; below 75 it climbs back one level every 5 s up to what was asked; above 100 it falls straight to the
+bootloader's speed. Never below that speed. A watch line repeats every 30 s ("watching: now ... hottest ... steps").
+Temperature watch on the phone, at the top levels (a51cpu0_khz=1742000 a51cpu1_khz=2314000 a51gpu_mhz=1053, 5 min with
+scripted swipes): the A73s crossed 83 °C under load (hottest 88 °C). The watch stepped them down as far as 1976 MHz and,
+once below 75 °C, back up one level every 5 s to 2314 MHz: 8 steps down, 8 up. The A53s (hottest 63 °C) and the GPU
+(64 °C) never needed it. Frames averaged 7.18 ms (7.75 at 1638/2080/572, 9.4 at the bootloader's speeds); 14074 GPU
+jobs, 0 failed, no panic. So the top levels are safe to ask for with the watch running.

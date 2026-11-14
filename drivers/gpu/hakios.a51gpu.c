@@ -1043,6 +1043,61 @@ cpu_clocks_say(void)
 	    (d1 & 0xf) + 1, (m1 & 1) ? " (NOT on the PLL)" : "", p1, m1, d1);
 }
 
+/*
+ * The SoC's temperatures, from its thermal unit (TMU, dt: BIG/LITTLE/G3D/ISP@10070000, one block): sensor 0 the GPU,
+ * 1 the A53s (and the ISP), 2 the A73s. Samsung: drivers/thermal/samsung/exynos_tmu.c (exynos9610_tmu_initialize,
+ * all_temp_show): CURRENT_TEMP1_0 0x40 holds sensors 0 and 1 (9 bits each), CURRENT_TEMP4_2 0x44 sensor 2 in its low 9;
+ * TRIMINFO(n) at n * 4: the sensor's codes at 25 and 85 degrees (bits 0-8 and 9-17), and in TRIMINFO(0) bit 23 whether
+ * both are trimmed (two-point) or only the first; a code of 0 means the dt's efuse value 0x37. CONTROL 0x20 bit 0: on.
+ * Degrees: two-point (code - e25) * 60 / (e85 - e25) + 25, one-point code - e25 + 25. Only read here.
+ */
+static vm_offset_t tmu_base;
+
+/* The three sensors' temperatures in degrees (-1000: no reading); false when the unit cannot be read. */
+static bool
+tmu_temps(int t[3])
+{
+	if (!tmu_base) {
+		tmu_base = ml_io_map(0x10070000UL, 0x1000);
+	}
+	if (!tmu_base) {
+		return false;
+	}
+	bool two_point = (rd(tmu_base + 0x00) >> 23) & 1;
+	uint32_t now10 = rd(tmu_base + 0x40), now42 = rd(tmu_base + 0x44);
+	uint32_t code[3] = { now10 & 0x1ff, (now10 >> 9) & 0x1ff, now42 & 0x1ff };
+
+	for (uint32_t i = 0; i < 3; i++) {
+		uint32_t trim = rd(tmu_base + i * 4), e25 = trim & 0x1ff, e85 = (trim >> 9) & 0x1ff;
+
+		if (e25 == 0) {
+			e25 = 0x37;
+		}
+		if (two_point && e85 != 0 && e85 != e25) {
+			t[i] = ((int)code[i] - (int)e25) * 60 / ((int)e85 - (int)e25) + 25;
+		} else {
+			t[i] = (int)code[i] - (int)e25 + 25;
+		}
+		if (code[i] == 0) {
+			t[i] = -1000;
+		}
+	}
+	return true;
+}
+
+static void
+tmu_say(void)
+{
+	int t[3];
+
+	if (!tmu_temps(t)) {
+		return;
+	}
+	printf("a51gpu: temperatures: GPU %d, A53s %d, A73s %d degrees (TMU control %x, codes %x %x, trim %x %x %x)\n", t[0],
+	    t[1], t[2], rd(tmu_base + 0x20), rd(tmu_base + 0x40), rd(tmu_base + 0x44), rd(tmu_base + 0), rd(tmu_base + 4),
+	    rd(tmu_base + 8));
+}
+
 /* In interrupt context: the line masked until the worker has looked, and the worker woken. */
 static void
 mali_irq(__unused void *context, uint32_t intid)
@@ -1117,6 +1172,7 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 				printf("a51gpu: clock: %s\n", mali_clock_state);
 			}
 			cpu_clocks_say();
+			tmu_say();
 			for (uint32_t t = mali_trouble_count > 4 ? mali_trouble_count - 4 : 0; t < mali_trouble_count; t++) {
 				printf("a51gpu: trouble %u of %u: %s\n", t + 1, mali_trouble_count, mali_trouble[t % 4]);
 			}
@@ -1241,7 +1297,7 @@ mali_keep(vm_offset_t mali)
  * kept GPU's status line (a whole system's start pushes it out of the kernel log):
  *   1  reads   the plugin table and the DVFS channel
  *   2  uploads and attaches the plugins Android attaches, then asks the GPU's present speed (FREQ_GET)
- *   3  asks    for a51gpu_mhz (default 572), one of the DT's levels, and reads PLL_G3D after
+ *   3  asks    for the top levels (or a51cpu0_khz, a51cpu1_khz, a51gpu_mhz), reads the PLLs, then watches the temperature
  */
 #define ACPM_MBOX_PHYS          0x11900000UL
 #define ACPM_SRAM_PHYS          0x02039000UL
@@ -1273,7 +1329,7 @@ struct acpm_channel {
 };
 
 static vm_offset_t acpm_sram, acpm_mbox, acpm_cmu;
-static uint32_t acpm_seq, acpm_steps, acpm_mhz = 572;
+static uint32_t acpm_seq, acpm_steps, acpm_mhz = 1053;
 static char mali_clock_state[240];             /* said with the status line (declared above too) */
 
 static void
@@ -1491,13 +1547,15 @@ clock_thread(__unused void *parameter, __unused wait_result_t result)
 
 	/*
 	 * Step 3: the levels asked for, each one of the DT's (cpufreq domain@0 and @1 mif-perf tables, mali gpu_dvfs_table).
-	 * Not the highest by default: nothing here watches the temperature yet. a51cpu0_khz, a51cpu1_khz, a51gpu_mhz.
+	 * By default the highest -- 1742, 2314 and 1053 MHz -- since the temperature watch below keeps them in Samsung's
+	 * limits (on the phone: the A73s held near 83 degrees under load, down to 1976 MHz and back). a51cpu0_khz,
+	 * a51cpu1_khz, a51gpu_mhz ask for less.
 	 */
 	static const uint32_t cl0_khz[] = { 1742000, 1638000, 1534000, 1456000, 1326000, 1222000, 1118000, 1053000, 910000,
 		                            806000, 702000, 598000, 403000 };
 	static const uint32_t cl1_khz[] = { 2314000, 2210000, 2184000, 2080000, 1976000, 1898000, 1768000, 1664000, 1508000,
 		                            1456000, 1352000, 1248000, 1144000, 1040000, 936000, 832000, 728000 };
-	uint32_t want[3] = { 1638000, 2080000, 0 };
+	uint32_t want[3] = { 1742000, 2314000, 0 };
 	PE_parse_boot_argn("a51cpu0_khz", &want[0], sizeof(want[0]));
 	PE_parse_boot_argn("a51cpu1_khz", &want[1], sizeof(want[1]));
 	for (uint32_t i = 0; i < sizeof(g3d_levels_khz) / sizeof(g3d_levels_khz[0]); i++) {
@@ -1536,6 +1594,82 @@ clock_thread(__unused void *parameter, __unused wait_result_t result)
 	clock_said("step 3: asked A53s %u, A73s %u, GPU %u kHz (%s%s%s); PLLs now A53s %u MHz, A73s %u MHz, GPU %u MHz (were "
 	    "%u, %u, %u)", want[0], want[1], want[2], answered[0] ? "a" : "-", answered[1] ? "a" : "-", answered[2] ? "a" : "-",
 	    pll_mhz(pll0), pll_mhz(pll1), pll_mhz(pllg), khz_now[0] / 1000, khz_now[1] / 1000, was / 1000);
+
+	/*
+	 * The temperature watch, from now on, once a second: Samsung's own limits (dt thermal-zones: the big cores throttle
+	 * from 83 degrees, passive; the little ones from 81; 115 is "hot"). A domain whose sensor reads above 83 drops one level
+	 * a second; below 75 it climbs back one level every five seconds, up to what was asked; above 100 it falls at once to
+	 * the speed the boot loader left. Never below that speed. Sensor 0 the GPU, 1 the A53s, 2 the A73s.
+	 */
+	const uint32_t *levels[3] = { cl0_khz, cl1_khz, g3d_levels_khz };
+	const uint32_t counts[3] = { sizeof(cl0_khz) / sizeof(cl0_khz[0]), sizeof(cl1_khz) / sizeof(cl1_khz[0]),
+		                     sizeof(g3d_levels_khz) / sizeof(g3d_levels_khz[0]) };
+	const uint32_t boot_khz[3] = { 1053000, 1456000, 260000 };
+	const uint32_t sensor_of[3] = { 1, 2, 0 };
+	uint32_t asked[3], at[3], floor_at[3], drops = 0, rises = 0, seconds = 0;
+	int hottest[3] = { -1000, -1000, -1000 };
+
+	for (uint32_t d = 0; d < 3; d++) {
+		asked[d] = at[d] = floor_at[d] = 0;
+		for (uint32_t i = 0; i < counts[d]; i++) {
+			if (levels[d][i] == want[d]) {
+				asked[d] = at[d] = i;
+			}
+			if (levels[d][i] == boot_khz[d]) {
+				floor_at[d] = i;
+			}
+		}
+	}
+	for (;;) {
+		int t[3];
+
+		IOSleep(1000);
+		seconds++;
+		if (!tmu_temps(t)) {
+			continue;
+		}
+		for (uint32_t d = 0; d < 3; d++) {
+			int temp = t[sensor_of[d]];
+			uint32_t to = at[d];
+
+			if (temp == -1000) {
+				continue;
+			}
+			if (temp > hottest[d]) {
+				hottest[d] = temp;
+			}
+			if (temp > 100) {
+				to = floor_at[d];
+			} else if (temp > 83 && at[d] < floor_at[d]) {
+				to = at[d] + 1;
+			} else if (temp < 75 && at[d] > asked[d] && seconds % 5 == 0) {
+				to = at[d] - 1;
+			}
+			if (to == at[d]) {
+				continue;
+			}
+			cmd[0] = domains[d];
+			cmd[1] = levels[d][to];
+			cmd[2] = ACPM_FREQ_REQ;
+			cmd[3] = 0;
+			if (acpm_call(&dvfs, cmd)) {
+				if (to > at[d]) {
+					drops++;
+				} else {
+					rises++;
+				}
+				printf("a51gpu: temperature watch: %s %d degrees: %u -> %u MHz\n", d == 0 ? "A53s" : d == 1 ? "A73s" : "GPU",
+				    temp, levels[d][at[d]] / 1000, levels[d][to] / 1000);
+				at[d] = to;
+			}
+		}
+		if (seconds % 30 == 0) {
+			clock_said("watching: now A53s %u, A73s %u, GPU %u MHz (asked %u, %u, %u); temperatures %d, %d, %d (hottest %d, %d, "
+			    "%d); %u steps down, %u up", levels[0][at[0]] / 1000, levels[1][at[1]] / 1000, levels[2][at[2]] / 1000,
+			    want[0] / 1000, want[1] / 1000, want[2] / 1000, t[1], t[2], t[0], hottest[0], hottest[1], hottest[2], drops,
+			    rises);
+		}
+	}
 }
 
 static thread_call_t clock_call;
