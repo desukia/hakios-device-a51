@@ -395,3 +395,27 @@ SpringBoard's idle cost: the text console draws every line into the framebuffer,
 process that wrote it. Frames averaged 9.4 ms. While widgets start (95-125 s), Weather, Calendar, WorldClock and Stocks
 widget extensions take up to 99% each; that settles by 145 s. The screen is clean (logs/a51-ios-273s.png: the home
 screen drawn through the Mali, no console text; a screenshot from an earlier run had misled me).
+
+### The DVFS channel, found (2026-11-14)
+
+Channel 5 was the wrong channel. Type 2 is TYPE_BUFFER (fw_header framework.h): a one-slot buffer the APM posts notices
+into, which Samsung's driver only ever reads (dequeue_policy; Motorola's exynos9610 tree shows the same). acpm_dvfs's
+own DT node (channel 5) is for acpm_noti_mif, MIF notices to the AP. DVFS requests (exynos_acpm_set_rate) go through
+acpm_dvfs.dev, which cal_if_init sets to the clock controller's node, clock-controller@0x12100000:
+acpm-ipc-channel = 0, a 15-slot TYPE_QUEUE ring, polled. Step 2 now sends FREQ_GET on channel 0 for domains 2 (A53s),
+3 (A73s) and 4 (GPU). Built, not yet run.
+Step 2 on channel 0: the firmware answers at once (no timeout), but FREQ_GET gives 0 for all three domains. Samsung's
+cpufreq (exynos-acme.c) only ever sends FREQ_REQ (cal_dfs_set_rate) and keeps the current rate itself, so FREQ_GET
+probably isn't answered with a rate by this firmware. Step 3 now asks levels from the DT's tables (cpufreq domain@0/@1
+mif-perf: A53s up to 1742 MHz, A73s up to 2314 MHz) and checks the PLLs. Default 1638 / 2080 / 572 MHz, not the
+highest: there's no thermal control yet. Boot-args a51cpu0_khz, a51cpu1_khz, a51gpu_mhz.
+Step 3 WORKS (2026-11-14): FREQ_REQ on channel 0 set all three. PLLs went from A53s 1053 → 1638 MHz (con0 a0bd0310),
+A73s 1456 → 2080 MHz (a0f00310) and GPU 260 → 572 MHz, with all three requests answered. The 2-minute run stayed stable
+at those speeds: 17160 GPU jobs, 0 failed, no resets, no panic. So the firmware also sets the voltages: nothing broke.
+Boot with `a51gpu_clock=3` (needs a51gpu=8; the plugins come from fw/ of root.apfs). Not yet: a profile at these
+speeds, any temperature watch (the tmu plugin is attached but nothing here reads it), and the top levels (1742 / 2314 /
+1053).
+Profile at the raised clocks (a51gpu_clock=3, same quiet GL rc.jobs.cputop build): frames averaged 7.75 ms against 9.4
+ms at the bootloader's clocks (about 18% faster), waiting for the GPU 2.6 ms against 3.5, idle CPU about 11% against 15%,
+and the widgets' start-up storm was over by about 130 s against about 145 s. Stable for the whole 5 minutes: 14704 GPU
+jobs, 0 failed, no resets, no panic.

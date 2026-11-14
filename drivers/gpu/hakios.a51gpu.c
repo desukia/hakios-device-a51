@@ -1228,7 +1228,9 @@ mali_keep(vm_offset_t mali)
  * done!"); without it nobody answers on the DVFS channel. Samsung: drivers/soc/samsung/acpm/acpm.c (plugins_init,
  * handle_dynamic_plugin), acpm_ipc.c, cal-if/acpm_dvfs.c; copies in ~/Desktop/ios-a51/ref/acpm.
  *   dt: acpm_ipc reg 0x11900000 (mailbox) and 0x2039000 (SRAM), initdata-base 0x6f00; acpm channel 4 (the framework:
- *       plugin attach), acpm_dvfs channel 5; mali g3d_cmu_cal_id 0xb040004 (ACPM domain 4), levels 260..1053 MHz
+ *       plugin attach); DVFS requests on channel 0, the clock controller's (cal-if gives acpm_dvfs that node: channel 5,
+ *       the acpm_dvfs node's, is a one-slot TYPE_BUFFER channel the APM posts MIF notices into, never a request channel);
+ *       mali g3d_cmu_cal_id 0xb040004 (ACPM domain 4), levels 260..1053 MHz; the CPU clusters are domains 2 and 3
  *   SRAM + initdata: struct acpm_framework: plugins at word 0, num_plugins word 1, ipc_channels word 2, ipc_ap_max word 6
  *   struct plugin (48 bytes): id, base_addr, acpm_ops, plugin_ops, secure/extern masks, timer (2 words),
  *       is_attached (byte, at 32), size (36), stay_attached (byte, at 40), fw_name (an SRAM offset, at 44)
@@ -1246,7 +1248,9 @@ mali_keep(vm_offset_t mali)
 #define ACPM_SRAM_SIZE          0x15000
 #define ACPM_INITDATA           0x6f00
 #define ACPM_FRAMEWORK_CHANNEL  4
-#define ACPM_DVFS_CHANNEL       5
+#define ACPM_DVFS_CHANNEL       0               /* dt: clock-controller@0x12100000 (cal-if's node, which it hands acpm_dvfs) */
+#define ACPM_CPUCL0_DOMAIN      2               /* Android: dvfs_cpucl0 - id : 2 (the A53s) */
+#define ACPM_CPUCL1_DOMAIN      3               /* dvfs_cpucl1 - id : 3 (the A73s) */
 #define ACPM_G3D_DOMAIN         4
 #define ACPM_INTGR0             0x0008
 #define ACPM_INTSR1             0x0028
@@ -1465,43 +1469,73 @@ clock_thread(__unused void *parameter, __unused wait_result_t result)
 	    dvfs.q_len, dvfs.q_elem_size, before.q_len, before.q_elem_size, dvfs.type, dvfs.ap_poll, dvfs.rx_rear,
 	    dvfs.rx_front, dvfs.rx_base, dvfs.tx_rear, dvfs.tx_front, dvfs.tx_base);
 	printf("a51gpu: ACPM: %s\n", layout);
-	cmd[0] = ACPM_G3D_DOMAIN;
-	cmd[1] = 0;
-	cmd[2] = ACPM_FREQ_GET;
-	cmd[3] = 0;
-	if (!acpm_call(&dvfs, cmd)) {
-		clock_said("step 2: plugins attached, but no answer to FREQ_GET; %s", layout);
-		return;
+	uint32_t khz_now[3];
+	static const uint32_t domains[3] = { ACPM_CPUCL0_DOMAIN, ACPM_CPUCL1_DOMAIN, ACPM_G3D_DOMAIN };
+	for (uint32_t d = 0; d < 3; d++) {
+		cmd[0] = domains[d];
+		cmd[1] = 0;
+		cmd[2] = ACPM_FREQ_GET;
+		cmd[3] = 0;
+		if (!acpm_call(&dvfs, cmd)) {
+			clock_said("step 2: plugins attached, but no answer to FREQ_GET (domain %u); %s", domains[d], layout);
+			return;
+		}
+		khz_now[d] = cmd[1];
 	}
-	uint32_t was = cmd[1];
-	clock_said("step 2: plugins attached; the GPU runs at %u kHz (answer %x %x %x %x); PLL con0 %x", was, cmd[0], cmd[1],
-	    cmd[2], cmd[3], rd(acpm_cmu + PLL_CON0_PLL_G3D));
+	uint32_t was = khz_now[2];
+	clock_said("step 2: ACPM answers: A53s %u kHz, A73s %u kHz, GPU %u kHz; PLL con0 GPU %x", khz_now[0], khz_now[1],
+	    khz_now[2], rd(acpm_cmu + PLL_CON0_PLL_G3D));
 	if (acpm_steps < 3) {
 		return;
 	}
 
-	uint32_t khz = 0;
+	/*
+	 * Step 3: the levels asked for, each one of the DT's (cpufreq domain@0 and @1 mif-perf tables, mali gpu_dvfs_table).
+	 * Not the highest by default: nothing here watches the temperature yet. a51cpu0_khz, a51cpu1_khz, a51gpu_mhz.
+	 */
+	static const uint32_t cl0_khz[] = { 1742000, 1638000, 1534000, 1456000, 1326000, 1222000, 1118000, 1053000, 910000,
+		                            806000, 702000, 598000, 403000 };
+	static const uint32_t cl1_khz[] = { 2314000, 2210000, 2184000, 2080000, 1976000, 1898000, 1768000, 1664000, 1508000,
+		                            1456000, 1352000, 1248000, 1144000, 1040000, 936000, 832000, 728000 };
+	uint32_t want[3] = { 1638000, 2080000, 0 };
+	PE_parse_boot_argn("a51cpu0_khz", &want[0], sizeof(want[0]));
+	PE_parse_boot_argn("a51cpu1_khz", &want[1], sizeof(want[1]));
 	for (uint32_t i = 0; i < sizeof(g3d_levels_khz) / sizeof(g3d_levels_khz[0]); i++) {
 		if ((g3d_levels_khz[i] + 500) / 1000 == acpm_mhz || g3d_levels_khz[i] / 1000 == acpm_mhz) {
-			khz = g3d_levels_khz[i];
+			want[2] = g3d_levels_khz[i];
 		}
 	}
-	if (khz == 0) {
-		clock_said("step 3: a51gpu_mhz=%u is not one of the GPU's levels", acpm_mhz);
+	bool ok0 = false, ok1 = false;
+	for (uint32_t i = 0; i < sizeof(cl0_khz) / sizeof(cl0_khz[0]); i++) {
+		ok0 |= cl0_khz[i] == want[0];
+	}
+	for (uint32_t i = 0; i < sizeof(cl1_khz) / sizeof(cl1_khz[0]); i++) {
+		ok1 |= cl1_khz[i] == want[1];
+	}
+	if (!ok0 || !ok1 || want[2] == 0) {
+		clock_said("step 3: not one of the DT's levels: A53s %u kHz %s, A73s %u kHz %s, GPU %u MHz %s", want[0],
+		    ok0 ? "ok" : "NO", want[1], ok1 ? "ok" : "NO", acpm_mhz, want[2] ? "ok" : "NO");
 		return;
 	}
-	cmd[0] = ACPM_G3D_DOMAIN;
-	cmd[1] = khz;
-	cmd[2] = ACPM_FREQ_REQ;
-	cmd[3] = 0;
-	bool set = acpm_call(&dvfs, cmd);
-	cmd[0] = ACPM_G3D_DOMAIN;
-	cmd[1] = 0;
-	cmd[2] = ACPM_FREQ_GET;
-	cmd[3] = 0;
-	bool got = acpm_call(&dvfs, cmd);
-	clock_said("step 3: %u kHz asked (%s); the GPU runs at %u kHz (was %u); PLL con0 %x", khz,
-	    set ? "answered" : "NO ANSWER", got ? cmd[1] : 0, was, rd(acpm_cmu + PLL_CON0_PLL_G3D));
+	bool answered[3];
+	for (uint32_t d = 0; d < 3; d++) {
+		cmd[0] = domains[d];
+		cmd[1] = want[d];
+		cmd[2] = ACPM_FREQ_REQ;
+		cmd[3] = 0;
+		answered[d] = acpm_call(&dvfs, cmd);
+	}
+	IOSleep(10);
+	uint32_t pll0 = cmu_cpucl0 ? rd(cmu_cpucl0 + 0x140) : 0, pll1 = cmu_cpucl1 ? rd(cmu_cpucl1 + 0x120) : 0;
+	if (!cmu_cpucl0) {
+		vm_offset_t c0 = ml_io_map(0x10900000UL, 0x2000), c1 = ml_io_map(0x10800000UL, 0x2000);
+		pll0 = c0 ? rd(c0 + 0x140) : 0;
+		pll1 = c1 ? rd(c1 + 0x120) : 0;
+	}
+	uint32_t pllg = rd(acpm_cmu + PLL_CON0_PLL_G3D);
+	clock_said("step 3: asked A53s %u, A73s %u, GPU %u kHz (%s%s%s); PLLs now A53s %u MHz, A73s %u MHz, GPU %u MHz (were "
+	    "%u, %u, %u)", want[0], want[1], want[2], answered[0] ? "a" : "-", answered[1] ? "a" : "-", answered[2] ? "a" : "-",
+	    pll_mhz(pll0), pll_mhz(pll1), pll_mhz(pllg), khz_now[0] / 1000, khz_now[1] / 1000, was / 1000);
 }
 
 static thread_call_t clock_call;
