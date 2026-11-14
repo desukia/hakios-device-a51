@@ -1,0 +1,9 @@
+# devices/a51/drivers/gpu/conf: the Galaxy A51's GPU (docs/porting/drivers.md).
+
+driver A51GPU
+	file    bsd/dev/hakios.a51gpu.c
+	file    iokit/Kernel/hakios.mali.cpp iokitcpp
+	help    the Mali-G72 MP3 of the Exynos 9611 woken step by step (a51gpu=N): its power domain, the secure
+	help    monitor's protection settings, and what its own registers say it is
+	help    ; with a51gpu=8 a51gpu_keep=1 the GPU stays on, and HakiosMali hands it to programs through the interface of
+	help    Linux's panfrost driver (what Mesa's Panfrost speaks)

@@ -1,0 +1,6 @@
+# devices/a51/drivers/input/conf: the Galaxy A51's own input drivers (docs/porting/drivers.md).
+
+driver A51INPUT
+	file    bsd/dev/hakios.a51input.c
+	help    the Galaxy A51's buttons (gpa1 5/6/7, buttons=1) and touch screen (Melfas MSS100 on I2C 0x13870000,
+	help    touchscreen=1); a51_touch_steps=N stops the touch bring-up after step N

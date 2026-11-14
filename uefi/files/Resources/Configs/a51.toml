@@ -1,0 +1,39 @@
+#
+# Samsung Galaxy A51 (SM-A515F, Exynos 9611)
+# Boot image layout copied from the phone's own boot.img (A515FXXU8HWI1): header v2, base 0x10000000,
+# page 2048; the DTB section is S-Boot's DT table (magic d7b7ab1e), taken unchanged from that image.
+#
+
+#
+# Boot Shim Configs
+#
+[boot_shim]
+requires_kernel_header = true
+
+#
+# UEFI FD Configs
+#
+[uefi_fd]
+base = 0xA0000000
+size = 0x200000
+
+#
+# Android Boot Image Kernel Configs
+#
+[boot_image_kernel]
+kernel_compression = "none"
+append_dtb         = false
+
+#
+# Android Boot Image Configs
+#
+[boot_image]
+dtb            = "Resources/DTBs/a51.dtb"
+header_version = 2
+base           = "0x10000000"
+kernel_offset  = "0x00008000"
+ramdisk_offset = "0x01000000"
+tags_offset    = "0x00000100"
+dtb_offset     = "0x00000000"
+os_version     = "13.0.0"
+os_patch_level = "2023-08"

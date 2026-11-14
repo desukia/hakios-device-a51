@@ -1,0 +1,4 @@
+# HakiOS defconfig for the Samsung Galaxy A51 (SM-A515F) (a51): the common kernel, the exynos9611 family's facts, and this device's own.
+#include common_defconfig
+#include exynos9611.config
+#include a51.config
