@@ -17,3 +17,14 @@ Every phone driver of the common repository is left out to begin with: their add
 for. Put one back in `configs/a51.config` when it has been made to work here, and say so in `device.conf`.
 
 Check with `tools/hakios-device.py check a51`.
+
+## Running iOS on it
+
+The phone boots iOS 16.5 from its darwin partition, from HakiOS's loader (PORTING.md has how that partition was made).
+The small image for that, with OpenGL ES on the Mali and the console quiet:
+
+    QUIET=1 GL=1 CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh
+
+and the boot-arguments for the GPU and the touch screen: `touchscreen=1 a51gpu=8 a51gpu_keep=1`. Leave `-v` out, and keep
+`QUIET=1`: launchd's output and the kernel's text console, drawn into the framebuffer by the CPU line by line, kept about
+a processor busy with the system idle (measured: about 116% of the CPU idle with them, about 15% without).

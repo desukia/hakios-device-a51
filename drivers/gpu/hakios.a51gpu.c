@@ -1010,6 +1010,39 @@ mali_gpu_check(void)
 	}
 }
 
+/*
+ * The CPU clusters' clocks, said with the status line (the bootloader sets them; ACPM would change them, and nothing
+ * does yet). CMU_CPUCL0 (the A53s) 0x10900000: PLL_CON0 0x140; CMU_CPUCL1 (the A73s) 0x10800000: PLL_CON0 0x120; both:
+ * MUX_CLK_CPUCLx_PLL 0x1000 (bit 0 clear: the PLL, set: the switch clock), DIV_CLK_CPUCLx_CPU 0x1810 (low bits: ratio - 1)
+ * (Samsung cmucal-sfr.c, exynos9610). A PLL's rate: 26 MHz x MDIV [25:16] / (PDIV [13:8] x 2^SDIV [2:0]).
+ */
+static vm_offset_t cmu_cpucl0, cmu_cpucl1;
+
+static uint32_t
+pll_mhz(uint32_t con0)
+{
+	uint32_t m = (con0 >> 16) & 0x3ff, p = (con0 >> 8) & 0x3f, sdiv = con0 & 7;
+
+	return p ? (uint32_t)(26ull * m / ((uint64_t)p << sdiv)) : 0;
+}
+
+static void
+cpu_clocks_say(void)
+{
+	if (!cmu_cpucl0) {
+		cmu_cpucl0 = ml_io_map(0x10900000UL, 0x2000);
+		cmu_cpucl1 = ml_io_map(0x10800000UL, 0x2000);
+	}
+	if (!cmu_cpucl0 || !cmu_cpucl1) {
+		return;
+	}
+	uint32_t p0 = rd(cmu_cpucl0 + 0x140), m0 = rd(cmu_cpucl0 + 0x1000), d0 = rd(cmu_cpucl0 + 0x1810);
+	uint32_t p1 = rd(cmu_cpucl1 + 0x120), m1 = rd(cmu_cpucl1 + 0x1000), d1 = rd(cmu_cpucl1 + 0x1810);
+	printf("a51gpu: CPU clocks: A53s PLL %u MHz / %u%s (con0 %x mux %x div %x), A73s PLL %u MHz / %u%s (con0 %x mux %x div %x); "
+	    "max 1850 and 2400\n", pll_mhz(p0), (d0 & 0xf) + 1, (m0 & 1) ? " (NOT on the PLL)" : "", p0, m0, d0, pll_mhz(p1),
+	    (d1 & 0xf) + 1, (m1 & 1) ? " (NOT on the PLL)" : "", p1, m1, d1);
+}
+
 /* In interrupt context: the line masked until the worker has looked, and the worker woken. */
 static void
 mali_irq(__unused void *context, uint32_t intid)
@@ -1083,6 +1116,7 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 			if (mali_clock_state[0]) {
 				printf("a51gpu: clock: %s\n", mali_clock_state);
 			}
+			cpu_clocks_say();
 			for (uint32_t t = mali_trouble_count > 4 ? mali_trouble_count - 4 : 0; t < mali_trouble_count; t++) {
 				printf("a51gpu: trouble %u of %u: %s\n", t + 1, mali_trouble_count, mali_trouble[t % 4]);
 			}

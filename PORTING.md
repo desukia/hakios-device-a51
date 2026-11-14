@@ -374,3 +374,24 @@ registers). Samsung's published acpm_ipc.c has no path for a one-slot channel (i
 so Android must send DVFS requests some way that source doesn't show. Parked. The steps stay behind a51gpu_clock=N.
 Leads: Android's /sys/kernel/debug/acpm_framework, ACPM's own log buffer in SRAM (log_buf_rear/front in acpm_framework),
 or a newer Samsung acpm_ipc.c that handles type-2 channels.
+
+### Where the lag comes from (profile, 2026-11-14)
+
+GL=1 with RC_JOBS=rc.jobs.cputop (rwtouch swipes, cputop every 5 s), boot-args touch_lat=1 cpuload=100:
+- CPU clocks as the bootloader leaves them: A53s at 1053 MHz (PLL con0 a0f30311; max 1850), A73s at 1456 MHz (a1500311;
+  max 2400), both on their PLLs, divider 1. That is about 60% of their top speed; changing it needs ACPM, the same
+  parked DVFS channel as the GPU (domains 2 and 3).
+- Idle, the system kept about 2.3 processors busy: vmd 92-96%, launchd 60-76%, SpringBoard about 45%, backboardd about
+  20%. vmd is visual voicemail: with CommCenter denied, it asks launchd for com.apple.commcenter.coretelephony.xpc in a
+  tight loop, and launchd answers and logs each refusal. Fixed: mkjobs.py denies com.apple.voicemail.
+- The window server's own frames averaged about 11 ms in this run (3.7 ms of it waiting for the GPU).
+Next: rerun the same profile without vmd; then look at SpringBoard's idle 45%.
+Without vmd (rerun): idle CPU went from about 235% to about 116% (launchd about 50%, SpringBoard about 45%, backboardd
+about 19%), and frames averaged 10.4 ms. launchd's remaining log volume is small, so next: QUIET=1 (launchd's stderr
+off the console) and no -v (a51-ios.sh VERBOSE=, so no kernel text console drawn over the screen).
+QUIET=1 and no -v (VERBOSE= ./a51-ios.sh): idle CPU about 15% in all (backboardd about 11%, SpringBoard about 2%;
+launchd off the list), against about 235% at first and 116% without vmd. So the console was most of launchd's and
+SpringBoard's idle cost: the text console draws every line into the framebuffer, on the CPU, in the context of the
+process that wrote it. Frames averaged 9.4 ms. While widgets start (95-125 s), Weather, Calendar, WorldClock and Stocks
+widget extensions take up to 99% each; that settles by 145 s. The screen is clean (logs/a51-ios-273s.png: the home
+screen drawn through the Mali, no console text; a screenshot from an earlier run had misled me).
