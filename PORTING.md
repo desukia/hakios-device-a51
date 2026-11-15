@@ -653,5 +653,11 @@ Found on the way:
 
 Result on the phone (2026-11-15): joined at boot from wifi.conf (5240 MHz), DHCP, the status bar's Wi-Fi icon, in 3
 minutes 30338 frames (42.5 MB) received and 14060 (1.2 MB) sent; no firmware panic. 402 frames were dropped for want
-of a free data block (FH_RFB returns lag in bursts). wifid's later scans while joined hear only 2-3 networks.
+of a free data block. wifid's later scans while joined hear only 2-3 networks.
+
+Drops fixed: a from-host queue holds 255 entries (byte indices) but the data pool has 512 blocks, and hip_put never
+checked for a full queue (hip4_q_add_signal returns -ENOSPC): in a burst the write index could lap the firmware's read
+index, losing frames and leaking their blocks. hip_put now refuses a full queue (the block is freed), and en0's
+transmit waits up to 10 ms (reclaiming) instead of dropping. Next run: 0 dropped of 10071 sent, 47 MB received, data
+blocks busy at most 321 and back to 0.
 

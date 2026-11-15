@@ -62,7 +62,7 @@
  * by MLME-ADD-VIF.cfm, SUCCESS); step 6's passive scan lists networks (MLME-SCAN.ind, chained blocks); step 7 joins a
  * WPA2-Personal network (handshake, both keys set) and decrypted data frames come in; step 8 (a51wifi=8) makes the radio
  * Darwin's Wi-Fi: en0, wifid's station side, DHCP and traffic both ways (iOS online, the status bar's Wi-Fi icon).
- * Not yet: an active scan, faster return of data blocks (frames dropped in bursts), power saving.
+ * Not yet: an active scan, the 2.4 GHz side of the home router (NOT_ALLOWED), power saving.
  */
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -448,12 +448,19 @@ static uint8_t hip_headroom, hip_tailroom;
  * A signal (and its payload) in the block at `offset` in the region, onto from-host queue `q`: the control pool's blocks
  * go on FH_CTRL (pool 1, class 5), the data pool's on FH_DAT (pool 0, class 4), as hip4_skb_to_mbulk.
  */
-static void
+static bool
 hip_put(vm_offset_t mbox, uint32_t offset, int q, uint8_t pool, uint8_t clas, const uint8_t *signal, uint32_t length,
     const uint8_t *payload, uint32_t payload_length)
 {
 	vm_offset_t h = wlbt_memory + hip_base, m = h + offset;
 	uint32_t sig_bufsz = ((MBULK_DESC + length + 4 + 3) & ~3u) - MBULK_DESC;
+
+	/* a queue holds 255 (its indices are bytes): full when the write index is one behind the firmware's read index
+	 * (hip4_q_add_signal: -ENOSPC). 512 data blocks and no such check let the write index lap the read index */
+	cache_out(h + HIP_SCOREBOARD, 128);
+	if ((uint8_t)(*(volatile uint8_t *)(h + HIP_SCOREBOARD + q) + 1) == *(volatile uint8_t *)(h + HIP_SCOREBOARD + 64 + q)) {
+		return false;
+	}
 
 	bzero((void *)m, 2048);
 	w8(m + 4, 1 | 4);                               /* MBULK_F_SIG | MBULK_F_OBOUND (the firmware checks it: mif_q.c) */
@@ -479,13 +486,14 @@ hip_put(vm_offset_t mbox, uint32_t offset, int q, uint8_t pool, uint8_t clas, co
 	w8(h + HIP_SCOREBOARD + q, (uint8_t)(w + 1));
 	cache_out(h + HIP_SCOREBOARD, 8);
 	wr(mbox + MBOX_INTGR1, 1u << HIP_FROMHOST_BIT);
+	return true;
 }
 
 static void
 hip_send(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_t length, const uint8_t *payload,
     uint32_t payload_length)
 {
-	hip_put(mbox, HIP_TX_CTL + block * 2048, Q_FH_CTRL, MBULK_POOL_CTRL, MBULK_CLASS_FROM_HOST_CTL, signal, length,
+	(void)hip_put(mbox, HIP_TX_CTL + block * 2048, Q_FH_CTRL, MBULK_POOL_CTRL, MBULK_CLASS_FROM_HOST_CTL, signal, length,
 	    payload, payload_length);
 }
 
@@ -1304,7 +1312,7 @@ static struct {
 	struct hakios_sta_bss bss;      /* the network joined or being joined */
 	bool scanning;
 	uint64_t sent, sent_bytes, dropped_out, received, received_bytes, dropped_in, amsdu;
-	uint32_t no_block;
+	uint32_t no_block, queue_full, waited, dat_busy, dat_busy_most;
 } svc;
 
 /* A free block of a pool, taken; -1: none. Under svc_lock. */
@@ -1336,6 +1344,9 @@ svc_reclaim(void)
 		cache_out(h + HIP_QUEUE(Q_FH_RFB) + 4 * r, 4);
 		uint32_t ref = rd(h + HIP_QUEUE(Q_FH_RFB) + 4 * r) - hip_base;
 		if (ref >= HIP_TX_DAT && ref < HIP_TX_DAT + DAT_BLOCKS * 2048) {
+			if (dat_used[(ref - HIP_TX_DAT) / 2048] && svc.dat_busy > 0) {
+				svc.dat_busy--;
+			}
 			dat_used[(ref - HIP_TX_DAT) / 2048] = 0;
 		} else if (ref >= HIP_TX_CTL && ref < HIP_TX_CTL + CTL_BLOCKS * 2048) {
 			ctl_used[(ref - HIP_TX_CTL) / 2048] = 0;
@@ -1358,15 +1369,19 @@ svc_send(bool data, const uint8_t *sig, uint32_t length, const uint8_t *payload,
 		lck_mtx_unlock(&svc_lock);
 		return false;
 	}
-	if (data) {
-		hip_put(svc_mbox, HIP_TX_DAT + (uint32_t)b * 2048, Q_FH_DAT, MBULK_POOL_DATA, MBULK_CLASS_FROM_HOST_DAT, sig, length,
-		    payload, payload_length);
-	} else {
-		hip_put(svc_mbox, HIP_TX_CTL + (uint32_t)b * 2048, Q_FH_CTRL, MBULK_POOL_CTRL, MBULK_CLASS_FROM_HOST_CTL, sig, length,
-		    payload, payload_length);
+	bool put = data ?
+	    hip_put(svc_mbox, HIP_TX_DAT + (uint32_t)b * 2048, Q_FH_DAT, MBULK_POOL_DATA, MBULK_CLASS_FROM_HOST_DAT, sig, length,
+	    payload, payload_length) :
+	    hip_put(svc_mbox, HIP_TX_CTL + (uint32_t)b * 2048, Q_FH_CTRL, MBULK_POOL_CTRL, MBULK_CLASS_FROM_HOST_CTL, sig, length,
+	    payload, payload_length);
+	if (!put) {
+		(data ? dat_used : ctl_used)[b] = 0;    /* the queue is full: the block stays free */
+		svc.queue_full++;
+	} else if (data && ++svc.dat_busy > svc.dat_busy_most) {
+		svc.dat_busy_most = svc.dat_busy;
 	}
 	lck_mtx_unlock(&svc_lock);
-	return true;
+	return put;
 }
 
 /* en0's frame to send: MA-UNITDATA.req (tx.c): vif 1, a host tag, priority 0 (best effort), peer 1 (the AP), 802.3. */
@@ -1392,7 +1407,18 @@ svc_transmit(mbuf_t packet, size_t length)
 	sig[13] = svc_data_tag >> 8;
 	sig[16] = 1;                                    /* peer index: the AP (queue set 0 + 1) */
 	sig[18] = 1;                                    /* FAPI_DATAUNITDESCRIPTOR_IEEE802_3_FRAME */
-	if (!svc_send(true, sig, sizeof(sig), frame, (uint32_t)length)) {
+	/* no block or no room in the queue: wait for the firmware to hand some back, up to 10 ms (Linux stops its queue
+	 * instead: the frames wait rather than go) */
+	bool sent = svc_send(true, sig, sizeof(sig), frame, (uint32_t)length);
+	if (!sent) {
+		svc.waited++;
+	}
+	for (int tries = 0; !sent && tries < 10; tries++) {
+		IOSleep(1);
+		svc_reclaim();
+		sent = svc_send(true, sig, sizeof(sig), frame, (uint32_t)length);
+	}
+	if (!sent) {
 		svc.dropped_out++;
 		return false;
 	}
@@ -1983,9 +2009,10 @@ svc_run(vm_offset_t mbox)
 			    *(volatile uint8_t *)(sb + 64), *(volatile uint8_t *)(sb + 65), *(volatile uint8_t *)(sb + 66),
 			    *(volatile uint8_t *)(sb + 67), *(volatile uint8_t *)(sb + 68), *(volatile uint8_t *)(sb + 69), busy_ctl, busy_dat,
 			    svc_events[0] ? svc_events : "none");
-			printf("a51wifi: service: phase %d; sent %llu frames (%llu bytes, %llu dropped, %u without a block), received %llu "
-			    "(%llu bytes, %llu A-MSDU subframes, %llu dropped); other signals: %s\n", svc.phase, svc.sent, svc.sent_bytes,
-			    svc.dropped_out, svc.no_block, svc.received, svc.received_bytes, svc.amsdu, svc.dropped_in,
+			printf("a51wifi: service: phase %d; sent %llu frames (%llu bytes, %llu dropped; waited %u times: %u without a block, "
+			    "%u a full queue; data blocks busy now %u, at most %u), received %llu (%llu bytes, %llu A-MSDU subframes, %llu "
+			    "dropped); other signals: %s\n", svc.phase, svc.sent, svc.sent_bytes, svc.dropped_out, svc.waited, svc.no_block,
+			    svc.queue_full, svc.dat_busy, svc.dat_busy_most, svc.received, svc.received_bytes, svc.amsdu, svc.dropped_in,
 			    link.ids[0] ? link.ids : "none");
 			link.ids[0] = 0;
 		}
