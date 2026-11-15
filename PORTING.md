@@ -602,3 +602,27 @@ handed back on TH_RFB (hip4_mbulk_to_skb). Result on the phone (2026-11-15): "TP
 and a hidden BSS of the same router. Only 2-4 reports per scan: passive dwell with the default timing is short; an
 active scan (wildcard SSID element, the supplicant's rates/HT elements) would see more.
 
+### WiFi step 7: WPA2-Personal connect (WORKS)
+
+`a51wifi=7` with `fw-wifi-a51/wifi.conf` (git-ignored; `ssid=`, `psk=` or `pmk=<64 hex>`; copied into root/fw by
+userland/build.sh; never printed). The handshake's arithmetic is in drivers/wifi/hakios.a51wpa.c (SHA-1, HMAC,
+PBKDF2, PRF-384, HMAC-SHA-1-128 MIC, AES key unwrap), built alone on the PC and checked against Python's hashlib/hmac,
+RFC 3394's vector and an access point simulated in Python (both MICs, TK, GTK, key id, RSC; a wrong passphrase fails
+at message 3). Signals, as Samsung's mlme.c / rx.c / cfg80211_ops.c:
+
+- MLME-CONNECT.req 0x200b: vif 1, BSSID @12, authentication 0 (open) @18, MHz*2 @20; data: SSID element and our RSN
+  element (30 14 01 00, 00-0f-ac-04 group, CCMP pairwise, PSK AKM, capabilities 0). Answers CONNECT.cfm 0, then
+  MLME-CONNECT.ind 0 (associated).
+- EAPOL from the AP arrives as MLME-RECEIVED-FRAME.ind 0x230d (data unit descriptor @12 = 1: the data is the 802.3
+  frame), not as MA-UNITDATA.ind. Ours go out as MLME-SEND-FRAME.req 0x2010 (vif 1, host tag @12 in steps of 4, data
+  unit descriptor 1 @14, message type @16: 2 for messages 1-3, 3 for message 4) with an 802.3 frame (to the BSSID,
+  ethertype 888e). MLME-FRAME-TRANSMISSION.ind 0x230c (host tag @12) says message 4 went out.
+- MLME-SETKEYS.req 0x2018: vif 1, length in bits @12, key id @14, type @16 (1 pairwise, 0 group), address @18, RSC @24
+  (bytes as received), cipher suite @40 as the u32 0x000fac04 little endian; data: the key. BOTH keys use the AP's
+  address ("Sta Group Key will use the peer address"); the group key against ff:ff:ff:ff:ff:ff is refused.
+- Then MLME-CONNECT-RES 0x2200 (vif 1).
+
+Result on the phone (2026-11-15): connected to TP-Link_6960, SETKEYS.cfm 0 and 0, 13 data frames (2424 bytes) in
+20 s as MA-UNITDATA.ind, decrypted by the firmware (e.g. IPv4 from another station). Next: a network interface in
+Darwin (ifnet over MA-UNITDATA.req/ind), DHCP.
+

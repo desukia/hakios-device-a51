@@ -47,14 +47,19 @@
  *              with Samsung's scan-timing and channel-list elements (2.4 GHz 1-13, 5 GHz 36-64, 100-140, 149-165);
  *              MLME-SCAN.ind's beacons and probe responses (both to-host queues) collected until MLME-SCAN-DONE.ind
  *              or 20 s, the networks listed
+ *   7  after the scan: WPA2-Personal to the network fw/wifi.conf names (ssid=..., psk=... or pmk=<64 hex>; never
+ *              printed): MLME-CONNECT.req (SSID and our RSN element: CCMP, PSK, the AP's group cipher), MLME-CONNECT.ind,
+ *              the 4-way handshake (hakios.a51wpa.c) over MA-UNITDATA.ind / MLME-SEND-FRAME.req, MLME-SETKEYS
+ *              (pairwise, group) once message 4 is out, MLME-CONNECT-RES; then the data frames that come in, counted
  *
  * What the steps found is said again every 30 s for five minutes: a whole system's start pushes the first lines out of
  * the kernel log.
  *
  * Status: steps 1 to 5 run on the phone (2026-11-15): the firmware starts (MM_START_IND) and so does the WLAN service
  * (SM_MSG_START_CFM, SAP MLME 14.7 / MA 14.1, as on Android); HIP4 signalling works both ways (MLME-ADD-VIF.req answered
- * by MLME-ADD-VIF.cfm, SUCCESS); step 6's passive scan lists networks (MLME-SCAN.ind, chained blocks). Not yet: an
- * active scan, connect (WPA2), packets.
+ * by MLME-ADD-VIF.cfm, SUCCESS); step 6's passive scan lists networks (MLME-SCAN.ind, chained blocks); step 7 joins a
+ * WPA2-Personal network (handshake, both keys set) and decrypted data frames come in. Not yet: an active scan, the
+ * data path into Darwin's network stack (an interface, DHCP).
  */
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -66,6 +71,7 @@
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <sys/random.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
@@ -573,6 +579,8 @@ static struct {
 	uint16_t mhz;
 	int16_t rssi;
 	uint8_t secured;
+	uint8_t rsn[48];                /* the AP's RSN element, whole (id, length, body) */
+	uint8_t rsn_length;
 } scan_seen[SCAN_MAX];
 static uint32_t scan_count, scan_frames, scan_other;
 static int scan_cfm = -1, scan_done;
@@ -637,14 +645,17 @@ scan_take(const uint8_t *sig, uint32_t sig_length, const uint8_t *data, uint32_t
 	scan_seen[i].rssi = (int16_t)(sig[14] | sig[15] << 8);
 	scan_seen[i].secured = (data[34] & 0x10) != 0;          /* capability: privacy */
 	for (uint32_t e = 36; e + 2 <= data_length && e + 2 + data[e + 1] <= data_length; e += 2 + data[e + 1]) {
-		if (data[e] == 0) {
+		if (data[e] == 0x30 && 2u + data[e + 1] <= sizeof(scan_seen[i].rsn)) {
+			scan_seen[i].rsn_length = (uint8_t)(2 + data[e + 1]);
+			memcpy(scan_seen[i].rsn, data + e, scan_seen[i].rsn_length);
+		}
+		if (data[e] == 0 && scan_seen[i].ssid[0] == 0) {
 			uint32_t n = data[e + 1] < 32 ? data[e + 1] : 32;
 			for (uint32_t k = 0; k < n; k++) {
 				uint8_t c = data[e + 2 + k];
 				scan_seen[i].ssid[k] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
 			}
 			scan_seen[i].ssid[n] = 0;
-			break;
 		}
 	}
 }
@@ -739,6 +750,408 @@ wifi_step6(vm_offset_t mbox)
 	wifi_said("step 6: scan %s: MLME-ADD-SCAN.cfm %s%x, %u scan reports, %u networks; other signals: %s",
 	    scan_done ? "done (MLME-SCAN-DONE.ind)" : "not done in 20 s", scan_cfm < 0 ? "none " : "result ",
 	    scan_cfm < 0 ? 0 : scan_cfm, scan_frames, scan_count, scan_ids[0] ? scan_ids : "none");
+}
+
+/*
+ * Step 7: connect. hakios.a51wpa.c does the handshake's arithmetic (checked on the PC against Python's hashlib/hmac,
+ * RFC 3394 and an access point simulated in Python); here the signals around it, as Samsung's mlme.c and rx.c.
+ */
+void a51wpa_pmk(const char *passphrase, size_t passphrase_length, const uint8_t *ssid, size_t ssid_length, uint8_t pmk[32]);
+void a51wpa_begin(const uint8_t pmk[32], const uint8_t aa[6], const uint8_t spa[6], const uint8_t snonce[32],
+    const uint8_t *rsn, size_t rsn_length);
+int a51wpa_frame(const uint8_t *frame, size_t length, uint8_t *out, size_t *out_length);
+size_t a51wpa_keys(uint8_t tk[16], uint8_t gtk[32], int *gtk_id, uint8_t rsc[8]);
+const char *a51wpa_failure(void);
+void a51wpa_forget(void);
+
+#define MLME_CONNECT_REQ        0x200b
+#define MLME_CONNECT_CFM        0x210b
+#define MLME_CONNECT_IND        0x2303
+#define MLME_CONNECT_RES        0x2200
+#define MLME_SEND_FRAME_REQ     0x2010
+#define MLME_SEND_FRAME_CFM     0x2110
+#define MLME_FRAME_TRANSMISSION_IND 0x230c
+#define MLME_SETKEYS_REQ        0x2018
+#define MLME_SETKEYS_CFM        0x2118
+#define MLME_DISCONNECT_IND     0x2308
+#define MLME_DISCONNECTED_IND   0x2309
+#define MA_UNITDATA_IND         0x1300
+#define MLME_RECEIVED_FRAME_IND 0x230d          /* EAPOL comes this way (data unit descriptor 1: an 802.3 frame) */
+#define DEBUG_WORD12_IND        0x8301
+#define DEBUG_GENERIC_IND       0x8302
+
+static const uint8_t station_address[6] = { 0x02, 0xa5, 0x1c, 0x00, 0x00, 0x01 };     /* locally administered */
+
+static struct {
+	uint8_t bssid[6];
+	uint32_t next_block;            /* control blocks 2..31 in turn */
+	uint16_t host_tag;
+	uint16_t m4_tag;
+	int connect_cfm, connect_ind, keys_cfm, keys_wanted;
+	bool m4_out, keys_set, connected;
+	int wpa_result;
+	uint32_t eapol, data_frames, data_bytes, setkeys_bad, disconnected;
+	uint16_t disconnect_reason;
+	uint16_t key_result[2];         /* MLME-SETKEYS.cfm's result: pairwise, group */
+	uint8_t cipher_group[4];
+	char ids[120];
+	char last_data[80];
+	vm_offset_t mbox;
+} link;
+
+static void
+hdr(uint8_t *sig, uint16_t id)
+{
+	sig[0] = id & 0xff;
+	sig[1] = id >> 8;
+	sig[4] = FAPI_SENDER & 0xff;
+	sig[5] = FAPI_SENDER >> 8;
+	sig[10] = 1;                                    /* vif 1 */
+}
+
+static void
+link_send(const uint8_t *sig, uint32_t length, const uint8_t *data, uint32_t data_length)
+{
+	hip_send(link.mbox, link.next_block, sig, length, data, data_length);
+	link.next_block = link.next_block >= 31 ? 2 : link.next_block + 1;
+}
+
+/* An EAPOL frame to the AP: MLME-SEND-FRAME.req with an 802.3 frame (tx.c slsi_tx_eapol, mlme.c send_frame_data). */
+static void
+send_eapol(const uint8_t *eapol, size_t length, bool m4)
+{
+	uint8_t sig[40], frame[300];
+
+	bzero(sig, sizeof(sig));
+	hdr(sig, MLME_SEND_FRAME_REQ);
+	link.host_tag = (uint16_t)(link.host_tag + 4);
+	sig[12] = link.host_tag & 0xff;
+	sig[13] = link.host_tag >> 8;
+	sig[14] = 1;                                    /* FAPI_DATAUNITDESCRIPTOR_IEEE802_3_FRAME */
+	sig[16] = m4 ? 3 : 2;                           /* FAPI_MESSAGETYPE_EAPOL_KEY_M4 / _M123 */
+	memcpy(frame, link.bssid, 6);
+	memcpy(frame + 6, station_address, 6);
+	frame[12] = 0x88;
+	frame[13] = 0x8e;
+	memcpy(frame + 14, eapol, length);
+	if (m4) {
+		link.m4_tag = link.host_tag;
+		link.m4_out = false;
+	}
+	link_send(sig, sizeof(sig), frame, (uint32_t)(14 + length));
+}
+
+static void
+send_key(uint16_t key_id, uint16_t key_type, const uint8_t *address, const uint8_t *rsc, const uint8_t cipher[4],
+    const uint8_t *key, uint32_t key_length)
+{
+	uint8_t sig[56];
+
+	bzero(sig, sizeof(sig));
+	hdr(sig, MLME_SETKEYS_REQ);
+	sig[12] = (uint8_t)((key_length * 8) & 0xff);
+	sig[13] = (uint8_t)((key_length * 8) >> 8);
+	sig[14] = (uint8_t)key_id;
+	sig[16] = (uint8_t)key_type;
+	memcpy(sig + 18, address, 6);
+	if (rsc != NULL) {
+		memcpy(sig + 24, rsc, 8);               /* the RSC's bytes, as Samsung packs them (pairs, little endian) */
+	}
+	/* the cipher suite selector, as the u32 00-0f-ac-04 (WLAN_CIPHER_SUITE_CCMP) little endian */
+	sig[40] = cipher[3];
+	sig[41] = cipher[2];
+	sig[42] = cipher[1];
+	sig[43] = cipher[0];
+	link_send(sig, sizeof(sig), key, key_length);
+	link.keys_wanted++;
+}
+
+static void
+link_note(uint16_t id)
+{
+	size_t n = strlen(link.ids);
+
+	if (n + 6 < sizeof(link.ids)) {
+		snprintf(link.ids + n, sizeof(link.ids) - n, "%04x ", id);
+	}
+}
+
+static void
+step7_take(const uint8_t *sig, uint32_t sig_length, const uint8_t *data, uint32_t data_length)
+{
+	uint16_t id = sig_length >= 2 ? (uint16_t)(sig[0] | sig[1] << 8) : 0;
+	uint16_t a = sig_length >= 14 ? (uint16_t)(sig[12] | sig[13] << 8) : 0;
+	uint16_t b = sig_length >= 16 ? (uint16_t)(sig[14] | sig[15] << 8) : 0;
+
+	switch (id) {
+	case MLME_CONNECT_CFM:
+		link.connect_cfm = a;
+		return;
+	case MLME_CONNECT_IND:
+		link.connect_ind = a;
+		return;
+	case MLME_SETKEYS_CFM:
+		if (link.keys_cfm < 2) {
+			link.key_result[link.keys_cfm] = a;
+		}
+		link.keys_cfm++;
+		if (a != 0) {
+			link.setkeys_bad = a;
+		}
+		return;
+	case MLME_FRAME_TRANSMISSION_IND:
+		if (a == link.m4_tag && link.m4_tag != 0) {
+			link.m4_out = true;
+		}
+		return;
+	case MLME_SEND_FRAME_CFM:
+	case DEBUG_WORD12_IND:
+	case DEBUG_GENERIC_IND:
+		return;
+	case MLME_DISCONNECT_IND:
+	case MLME_DISCONNECTED_IND:
+		link.disconnected++;
+		link.disconnect_reason = sig_length >= 20 ? (uint16_t)(sig[18] | sig[19] << 8) : 0xffff;
+		link_note(id);
+		return;
+	case MLME_RECEIVED_FRAME_IND:
+	case MA_UNITDATA_IND: {
+		/* an 802.3 frame: MA-UNITDATA.ind's after any proprietary information (its length at signal 20);
+		 * MLME-RECEIVED-FRAME.ind's when its data unit descriptor (signal 12) is 1 (rx.c) */
+		uint32_t skip = 0;
+		if (id == MLME_RECEIVED_FRAME_IND && a != 1) {
+			link_note(id);
+			return;
+		}
+		if (id == MA_UNITDATA_IND && sig_length >= 22) {
+			skip = (uint32_t)(sig[20] | sig[21] << 8);
+		}
+		if (skip + 14 > data_length) {
+			return;
+		}
+		const uint8_t *f = data + skip;
+		uint32_t n = data_length - skip;
+		if (f[12] == 0x88 && f[13] == 0x8e) {
+			uint8_t out[256];
+			size_t out_length = 0;
+			link.eapol++;
+			int r = a51wpa_frame(f + 14, n - 14, out, &out_length);
+			if (r == 2 || r == 4) {
+				send_eapol(out, out_length, r == 4);
+			}
+			if (r != 0) {
+				link.wpa_result = r;
+			}
+			return;
+		}
+		if (link.connected) {
+			link.data_frames++;
+			link.data_bytes += n;
+			snprintf(link.last_data, sizeof(link.last_data), "%02x:%02x:%02x:%02x:%02x:%02x type %02x%02x, %u bytes",
+			    f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], n);
+		}
+		return;
+	}
+	default:
+		link_note(id);
+		return;
+	}
+}
+
+/* fw/wifi.conf: ssid=NAME, psk=PASSPHRASE or pmk=64 hex digits. Its values are never printed. */
+static bool
+wifi_conf(char *ssid, size_t ssid_size, char *psk, size_t psk_size, uint8_t pmk[32], bool *have_pmk)
+{
+	uint64_t length = 0;
+	const char *text = hakios_image_file("fw", "wifi.conf", &length, NULL);
+
+	ssid[0] = psk[0] = 0;
+	*have_pmk = false;
+	if (text == NULL) {
+		return false;
+	}
+	for (uint64_t i = 0; i < length;) {
+		uint64_t end = i;
+		while (end < length && text[end] != '\n' && text[end] != '\r') {
+			end++;
+		}
+		const char *line = text + i;
+		uint64_t n = end - i;
+		if (n > 5 && memcmp(line, "ssid=", 5) == 0 && n - 5 < ssid_size) {
+			memcpy(ssid, line + 5, n - 5);
+			ssid[n - 5] = 0;
+		} else if (n > 4 && memcmp(line, "psk=", 4) == 0 && n - 4 < psk_size) {
+			memcpy(psk, line + 4, n - 4);
+			psk[n - 4] = 0;
+		} else if (n == 68 && memcmp(line, "pmk=", 4) == 0) {
+			bool good = true;
+			for (int k = 0; k < 64; k++) {
+				char c = line[4 + k];
+				int v = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+				if (v < 0) {
+					good = false;
+					break;
+				}
+				pmk[k / 2] = (uint8_t)((k & 1) ? (pmk[k / 2] | v) : v << 4);
+			}
+			*have_pmk = good;
+		}
+		i = end;
+		while (i < length && (text[i] == '\n' || text[i] == '\r')) {
+			i++;
+		}
+	}
+	return ssid[0] != 0 && (psk[0] != 0 || *have_pmk);
+}
+
+/* Does an RSN element (whole) list this suite (00-0f-ac-type) in the list starting at `at`? */
+static bool
+rsn_has(const uint8_t *rsn, uint32_t length, uint32_t *at, uint8_t type)
+{
+	bool found = false;
+
+	if (*at + 2 > length) {
+		return false;
+	}
+	uint32_t count = rsn[*at] | rsn[*at + 1] << 8;
+	*at += 2;
+	for (uint32_t k = 0; k < count && *at + 4 <= length; k++, *at += 4) {
+		if (rsn[*at] == 0x00 && rsn[*at + 1] == 0x0f && rsn[*at + 2] == 0xac && rsn[*at + 3] == type) {
+			found = true;
+		}
+	}
+	return found;
+}
+
+static void
+wifi_step7(vm_offset_t mbox)
+{
+	char ssid[33], psk[64];
+	uint8_t pmk[32], snonce[32];
+	bool have_pmk;
+
+	bzero(&link, sizeof(link));
+	link.mbox = mbox;
+	link.next_block = 2;
+	if (!wifi_conf(ssid, sizeof(ssid), psk, sizeof(psk), pmk, &have_pmk)) {
+		wifi_said("step 7: no fw/wifi.conf with ssid= and psk= (or pmk=): stopping");
+		return;
+	}
+	/* the network: the strongest with that SSID */
+	int best = -1;
+	for (uint32_t i = 0; i < scan_count; i++) {
+		if (strcmp(scan_seen[i].ssid, ssid) == 0 && (best < 0 || scan_seen[i].rssi > scan_seen[best].rssi)) {
+			best = (int)i;
+		}
+	}
+	if (best < 0) {
+		wifi_said("step 7: the network of fw/wifi.conf was not in the scan (%u networks): stopping", scan_count);
+		bzero(psk, sizeof(psk));
+		return;
+	}
+	/* its RSN element: version, group cipher, pairwise ciphers, AKMs, capabilities */
+	const uint8_t *ap = scan_seen[best].rsn;
+	uint32_t ap_length = scan_seen[best].rsn_length, at = 8;
+	if (ap_length < 8 + 2 + 4 + 2 + 4) {
+		wifi_said("step 7: the network has no RSN element (WPA1 or open): not handled; stopping");
+		bzero(psk, sizeof(psk));
+		return;
+	}
+	memcpy(link.cipher_group, ap + 4, 4);
+	bool ccmp = rsn_has(ap, ap_length, &at, 4), psk_akm = rsn_has(ap, ap_length, &at, 2);
+	uint16_t caps = at + 2 <= ap_length ? (uint16_t)(ap[at] | ap[at + 1] << 8) : 0;
+	bool group_ok = link.cipher_group[0] == 0x00 && link.cipher_group[1] == 0x0f && link.cipher_group[2] == 0xac &&
+	    link.cipher_group[3] == 4;
+	if (!ccmp || !psk_akm || !group_ok || (caps & 0x40)) {
+		wifi_said("step 7: the network wants what is not handled yet (CCMP pairwise %d, PSK %d, CCMP group %d, MFP "
+		    "required %d): stopping", ccmp, psk_akm, group_ok, (caps & 0x40) != 0);
+		bzero(psk, sizeof(psk));
+		return;
+	}
+	static const uint8_t rsn[22] = { 0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+		                         0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00 };
+
+	if (!have_pmk) {
+		a51wpa_pmk(psk, strlen(psk), (const uint8_t *)ssid, strlen(ssid), pmk);
+	}
+	bzero(psk, sizeof(psk));
+	read_random(snonce, sizeof(snonce));
+	memcpy(link.bssid, scan_seen[best].bssid, 6);
+	a51wpa_begin(pmk, link.bssid, station_address, snonce, rsn, sizeof(rsn));
+	bzero(pmk, sizeof(pmk));
+
+	/* MLME-CONNECT.req: vif 1, the BSSID, open system, the channel (MHz * 2); data: the SSID and RSN elements */
+	uint8_t sig[34], data[64];
+	uint32_t n = 0, ssid_length = (uint32_t)strlen(ssid);
+	bzero(sig, sizeof(sig));
+	hdr(sig, MLME_CONNECT_REQ);
+	memcpy(sig + 12, link.bssid, 6);
+	sig[20] = (uint8_t)((scan_seen[best].mhz * 2) & 0xff);
+	sig[21] = (uint8_t)((scan_seen[best].mhz * 2) >> 8);
+	data[n++] = 0;
+	data[n++] = (uint8_t)ssid_length;
+	memcpy(data + n, ssid, ssid_length);
+	n += ssid_length;
+	memcpy(data + n, rsn, sizeof(rsn));
+	n += sizeof(rsn);
+	printf("a51wifi: step 7: MLME-CONNECT.req to %02x:%02x:%02x:%02x:%02x:%02x at %u MHz (%d dBm)\n", link.bssid[0],
+	    link.bssid[1], link.bssid[2], link.bssid[3], link.bssid[4], link.bssid[5], scan_seen[best].mhz,
+	    scan_seen[best].rssi);
+	link.connect_cfm = link.connect_ind = -1;
+	link_send(sig, sizeof(sig), data, n);
+
+	/* the association, the handshake, the keys: 20 s; then what comes in, 20 s more */
+	int done_at = -1, m4_at = -1;
+	for (int ms = 0; ms <= 40000; ms += 10) {
+		uint32_t got = hip_take(mbox, Q_TH_CTRL, step7_take) + hip_take(mbox, Q_TH_DAT, step7_take);
+		if (link.wpa_result == 4 && m4_at < 0) {
+			m4_at = ms;
+		}
+		/* message 4 out (or 1 s gone): the keys (as wpa_supplicant), then MLME-CONNECT-RES (rx.c, on M4's status) */
+		if (!link.keys_set && m4_at >= 0 && (link.m4_out || ms - m4_at > 1000)) {
+			uint8_t tk[16], gtk[32], rsc[8];
+			int gtk_id;
+			size_t gtk_length = a51wpa_keys(tk, gtk, &gtk_id, rsc);
+			/* both against the AP's address: "Sta Group Key will use the peer address" (cfg80211_ops.c slsi_add_key) */
+			send_key(0, 1, link.bssid, NULL, link.cipher_group, tk, 16);
+			send_key((uint16_t)gtk_id, 0, link.bssid, rsc, link.cipher_group, gtk, (uint32_t)gtk_length);
+			bzero(tk, sizeof(tk));
+			bzero(gtk, sizeof(gtk));
+			link.keys_set = true;
+		}
+		if (link.keys_set && !link.connected && link.keys_cfm >= link.keys_wanted) {
+			uint8_t res[24];
+			bzero(res, sizeof(res));
+			hdr(res, MLME_CONNECT_RES);
+			link_send(res, sizeof(res), NULL, 0);
+			link.connected = true;
+			done_at = ms;
+			printf("a51wifi: step 7: keys set, MLME-CONNECT-RES sent\n");
+		}
+		if (link.wpa_result < 0 || link.disconnected || (link.connect_cfm > 0) || (link.connect_ind > 0)) {
+			break;
+		}
+		if (done_at < 0 && ms > 20000) {
+			break;
+		}
+		if (done_at >= 0 && ms - done_at > 20000) {
+			break;
+		}
+		if (got == 0) {
+			IOSleep(10);
+		}
+	}
+	a51wpa_forget();
+	if (link.connected && !link.disconnected) {
+		wifi_said("step 7: CONNECTED to \"%s\" (WPA2; SETKEYS.cfm pairwise %#x, group %#x); in 20 s: %u data frames, %u bytes%s%s; "
+		    "other signals: %s", ssid, link.key_result[0], link.key_result[1], link.data_frames,
+		    link.data_bytes, link.data_frames ? ", the last from " : "", link.last_data, link.ids[0] ? link.ids : "none");
+	} else {
+		wifi_said("step 7: not connected: CONNECT.cfm %d, CONNECT.ind %d, EAPOL frames %u, handshake %d%s%s, keys %u/%u, "
+		    "disconnected %u (reason %u); other signals: %s", link.connect_cfm, link.connect_ind, link.eapol,
+		    link.wpa_result, link.wpa_result < 0 ? ": " : "", link.wpa_result < 0 ? a51wpa_failure() : "",
+		    link.keys_cfm, link.keys_wanted, link.disconnected, link.disconnect_reason, link.ids[0] ? link.ids : "none");
+	}
 }
 
 /* Step 5: MLME-ADD-VIF.req, and what comes back. */
@@ -1177,6 +1590,14 @@ wifi_step2(const uint8_t *fw, uint64_t size)
 				IOSleep(100);
 				wifi_step6(mbox);
 				printf("a51wifi: (step 5 was: %s)\n", added);
+				if (wifi_steps >= 7 && scan_count > 0) {
+					char scanned[256];
+
+					strlcpy(scanned, wifi_state, sizeof(scanned));
+					IOSleep(100);
+					wifi_step7(mbox);
+					printf("a51wifi: (step 6 was: %s)\n", scanned);
+				}
 			}
 		}
 	}
