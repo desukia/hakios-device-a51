@@ -585,3 +585,20 @@ into the block's signal buffer (hip4_mbulk_to_skb). Expected: MLME-ADD-VIF.cfm 0
 Result on the phone (2026-11-15): seven DebugWord12_indication (0x8301) and then MLME-ADD-VIF.cfm (0x2107), vif 1,
 result 0. Every to-host block was handed back through TH_RFB without complaint. Signal names are in
 fw-wifi-a51/debug/symbols.dbg (section "signalid").
+
+### WiFi step 6: passive scan (WORKS)
+
+`a51wifi=6`, after MLME-ADD-VIF.cfm: MLME-ADD-SCAN.req (0x2005) as Samsung's slsi_mlme_add_scan (full source in
+~/Desktop/kernel_samsung_universal9611/drivers/net/wireless/scsc/mlme.c): header vif 0, scan_id 0x0100 (interface 1 << 8),
+scan_type 2 (full), device address, report mode 0x0004 (real time); data: the scan-timing element
+(dd 11 00 16 32 01 01, zeros) and the channel list (dd len 00 16 32 01 02, then le16 MHz*2 and a policy byte per
+channel, 0x01 = passive since no SSIDs are given). The data goes after the signal buffer plus the firmware's
+headroom (config byte 28; tailroom byte 29), dat_bufsz = data + headroom + tailroom, refcount 1.
+
+Answers: MLME-ADD-SCAN.cfm result 0, MLME-SCAN.ind (0x2300; channel_frequency = MHz*2 at signal 12, rssi at 14) and
+MLME-SCAN-DONE.ind (0x2301). A scan report is a chain: the head block (flag 0xc5 = SIG | OBOUND | CHAIN_HEAD |
+CHAIN) holds only the signal, chain_next (byte 16) points to the block with the beacon; every block of the chain is
+handed back on TH_RFB (hip4_mbulk_to_skb). Result on the phone (2026-11-15): "TP-Link_6960" 5240 MHz -53 dBm, secured,
+and a hidden BSS of the same router. Only 2-4 reports per scan: passive dwell with the default timing is short; an
+active scan (wildcard SSID element, the supplicant's rates/HT elements) would see more.
+

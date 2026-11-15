@@ -43,13 +43,18 @@
  *              administered address), in an mbulk of the control pool put on the from-host control queue (scoreboard
  *              byte 0, from-host bit 5); every to-host control signal of the next 3 s logged and handed back (the to-host
  *              RFB queue), up to MLME-ADD-VIF.cfm
+ *   6  after MLME-ADD-VIF.cfm: a passive scan, MLME-ADD-SCAN.req (vif 0, scan id 0x100, full scan, real-time reports)
+ *              with Samsung's scan-timing and channel-list elements (2.4 GHz 1-13, 5 GHz 36-64, 100-140, 149-165);
+ *              MLME-SCAN.ind's beacons and probe responses (both to-host queues) collected until MLME-SCAN-DONE.ind
+ *              or 20 s, the networks listed
  *
  * What the steps found is said again every 30 s for five minutes: a whole system's start pushes the first lines out of
  * the kernel log.
  *
  * Status: steps 1 to 5 run on the phone (2026-11-15): the firmware starts (MM_START_IND) and so does the WLAN service
  * (SM_MSG_START_CFM, SAP MLME 14.7 / MA 14.1, as on Android); HIP4 signalling works both ways (MLME-ADD-VIF.req answered
- * by MLME-ADD-VIF.cfm, SUCCESS). Not yet: scan, connect, packets.
+ * by MLME-ADD-VIF.cfm, SUCCESS); step 6's passive scan lists networks (MLME-SCAN.ind, chained blocks). Not yet: an
+ * active scan, connect (WPA2), packets.
  */
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -418,9 +423,15 @@ hcf_payload(const uint8_t *data, uint64_t length, uint32_t *out_length)
 
 static uint32_t hip_base;                       /* step 4's region, as an offset in the 16 MB */
 
-/* Put a FAPI signal (no payload) into control block `block` and onto the from-host control queue. */
+/*
+ * Put a FAPI signal into control block `block` and onto the from-host control queue. A payload goes after the signal
+ * buffer, past the headroom the firmware asked for (its config's unidat_req_headroom/tailroom), as hip4_skb_to_mbulk.
+ */
+static uint8_t hip_headroom, hip_tailroom;
+
 static void
-hip_send_signal(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_t length)
+hip_send(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_t length, const uint8_t *payload,
+    uint32_t payload_length)
 {
 	vm_offset_t h = wlbt_memory + hip_base, m = h + HIP_TX_CTL + block * 2048;
 	uint32_t sig_bufsz = ((MBULK_DESC + length + 4 + 3) & ~3u) - MBULK_DESC;
@@ -430,8 +441,16 @@ hip_send_signal(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_
 	w8(m + 5, MBULK_CLASS_FROM_HOST_CTL);
 	w8(m + 6, MBULK_POOL_CTRL);
 	w16(m + 10, (uint16_t)sig_bufsz);
-	w16(m + 14, (uint16_t)sig_bufsz);               /* head: no data after the signal */
 	memcpy((void *)(m + MBULK_DESC + 4), signal, length);
+	if (payload_length != 0) {
+		w8(m + 7, 1);                           /* refcount 1 with a data buffer */
+		w16(m + 8, (uint16_t)(payload_length + hip_headroom + hip_tailroom));
+		w16(m + 12, (uint16_t)payload_length);
+		w16(m + 14, (uint16_t)(sig_bufsz + hip_headroom));
+		memcpy((void *)(m + MBULK_DESC + sig_bufsz + hip_headroom), payload, payload_length);
+	} else {
+		w16(m + 14, (uint16_t)sig_bufsz);       /* head: no data after the signal */
+	}
 	cache_out(m, 2048);
 
 	cache_out(h + HIP_SCOREBOARD, 128);
@@ -443,7 +462,288 @@ hip_send_signal(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_
 	wr(mbox + MBOX_INTGR1, 1u << HIP_FROMHOST_BIT);
 }
 
+static void
+hip_send_signal(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_t length)
+{
+	hip_send(mbox, block, signal, length, NULL, 0);
+}
+
+/*
+ * Take what the firmware put on to-host queue `q` (TH_CTRL or TH_DAT): each block to `take` (its signal, the data after
+ * its head and the data's length), then handed back on TH_RFB. Returns how many were taken.
+ */
+static uint8_t hip_last_mbulk[64];           /* the block being taken: its descriptor and what follows */
+static uint32_t hip_last_ref;
+
+typedef void (*hip_taker_t)(const uint8_t *signal, uint32_t signal_length, const uint8_t *data, uint32_t data_length);
+
+/* Hand a to-host block back to the firmware: onto TH_RFB. */
+static void
+hip_give_back(uint32_t ref)
+{
+	vm_offset_t h = wlbt_memory + hip_base;
+	uint8_t rw = *(volatile uint8_t *)(h + HIP_SCOREBOARD + Q_TH_RFB);
+
+	w32(h + HIP_QUEUE(Q_TH_RFB) + 4 * rw, ref);
+	cache_out(h + HIP_QUEUE(Q_TH_RFB) + 4 * rw, 4);
+	w8(h + HIP_SCOREBOARD + Q_TH_RFB, (uint8_t)(rw + 1));
+	cache_out(h + HIP_SCOREBOARD, 8);
+}
+
+#define MBULK_F_CHAIN_HEAD      0x40
+#define MBULK_F_CHAIN           0x80
+#define MBULK_MAX_CHAIN         16
+static uint8_t hip_rx_data[8192];               /* a chained block's data, put together */
+
+static uint32_t
+hip_take(vm_offset_t mbox, int q, hip_taker_t take)
+{
+	vm_offset_t h = wlbt_memory + hip_base;
+	uint32_t taken = 0;
+
+	cache_out(h + HIP_SCOREBOARD, 128);
+	uint8_t r = *(volatile uint8_t *)(h + HIP_SCOREBOARD + q);
+	uint8_t fw_w = *(volatile uint8_t *)(h + HIP_SCOREBOARD + 64 + q);
+
+	while (r != fw_w) {
+		cache_out(h + HIP_QUEUE(q) + 4 * r, 4);
+		uint32_t ref = rd(h + HIP_QUEUE(q) + 4 * r);
+		if (ref >= WLBT_MEMORY - 4096) {
+			break;
+		}
+		vm_offset_t m = wlbt_memory + ref;
+		cache_out(m, 64);
+		uint16_t sig_bufsz = *(volatile uint16_t *)(m + 10), len = *(volatile uint16_t *)(m + 12);
+		uint16_t head = *(volatile uint16_t *)(m + 14);
+		memcpy(hip_last_mbulk, (const void *)m, sizeof(hip_last_mbulk));
+		hip_last_ref = ref;
+		uint8_t flag = *(volatile uint8_t *)(m + 4);
+		if (MBULK_DESC + head + len <= 4096 && sig_bufsz >= 4) {
+			cache_out(m, MBULK_DESC + head + len);
+			/* the data: this block's, then each chained block's (as hip4_mbulk_to_skb), all handed back */
+			uint32_t have = len < sizeof(hip_rx_data) ? len : sizeof(hip_rx_data);
+			memcpy(hip_rx_data, (const void *)(m + MBULK_DESC + head), have);
+			if ((flag & MBULK_F_CHAIN_HEAD) && (flag & MBULK_F_CHAIN)) {
+				uint32_t next = *(volatile uint32_t *)(m + 16);
+				for (int c = 0; c < MBULK_MAX_CHAIN && next != 0 && next < WLBT_MEMORY - 4096; c++) {
+					vm_offset_t n = wlbt_memory + next;
+					cache_out(n, 64);
+					uint16_t n_len = *(volatile uint16_t *)(n + 12), n_head = *(volatile uint16_t *)(n + 14);
+					uint8_t n_flag = *(volatile uint8_t *)(n + 4);
+					if (MBULK_DESC + n_head + n_len <= 4096) {
+						cache_out(n, MBULK_DESC + n_head + n_len);
+						uint32_t more = n_len;
+						if (have + more > sizeof(hip_rx_data)) {
+							more = sizeof(hip_rx_data) - have;
+						}
+						memcpy(hip_rx_data + have, (const void *)(n + MBULK_DESC + n_head), more);
+						have += more;
+					}
+					uint32_t following = *(volatile uint32_t *)(n + 16);
+					hip_give_back(next);
+					if (!(n_flag & MBULK_F_CHAIN)) {
+						break;
+					}
+					next = following;
+				}
+			}
+			take((const uint8_t *)(m + MBULK_DESC + 4), sig_bufsz - 4u, hip_rx_data, have);
+		}
+		hip_give_back(ref);
+		r++;
+		w8(h + HIP_SCOREBOARD + q, r);
+		cache_out(h + HIP_SCOREBOARD, 8);
+		wr(mbox + MBOX_INTGR1, 1u << HIP_FROMHOST_BIT);
+		taken++;
+	}
+	return taken;
+}
+
+/* Step 6's scan: what came back. */
+#define MLME_ADD_SCAN_REQ       0x2005
+#define MLME_ADD_SCAN_CFM       0x2105
+#define MLME_SCAN_IND           0x2300
+#define MLME_SCAN_DONE_IND      0x2301
+#define Q_TH_DAT                4
+#define SCAN_MAX                40
+
+static struct {
+	uint8_t bssid[6];
+	char ssid[33];
+	uint16_t mhz;
+	int16_t rssi;
+	uint8_t secured;
+} scan_seen[SCAN_MAX];
+static uint32_t scan_count, scan_frames, scan_other;
+static int scan_cfm = -1, scan_done;
+static char scan_ids[120];
+static char scan_debug[1300];
+
+static void
+scan_take(const uint8_t *sig, uint32_t sig_length, const uint8_t *data, uint32_t data_length)
+{
+	uint16_t id = sig_length >= 2 ? (uint16_t)(sig[0] | sig[1] << 8) : 0;
+
+	if (id == MLME_ADD_SCAN_CFM && sig_length >= 14) {
+		scan_cfm = sig[12] | sig[13] << 8;
+		return;
+	}
+	if (id == MLME_SCAN_DONE_IND) {
+		scan_done = 1;
+		return;
+	}
+	if (id != MLME_SCAN_IND || sig_length < 16) {
+		size_t n = strlen(scan_ids);
+		scan_other++;
+		if (n + 6 < sizeof(scan_ids)) {
+			snprintf(scan_ids + n, sizeof(scan_ids) - n, "%04x ", id);
+		}
+		return;
+	}
+	scan_frames++;
+	if (scan_frames <= 3) {                        /* the layout, for checking: block, signal, data */
+		char line[400];
+		int k = snprintf(line, sizeof(line), "a51wifi: scan report %u: block %x:", scan_frames, hip_last_ref);
+		for (int b = 0; b < 64 && k < (int)sizeof(line) - 4; b++) {
+			k += snprintf(line + k, sizeof(line) - k, "%s%02x", b % 4 ? "" : " ", hip_last_mbulk[b]);
+		}
+		k += snprintf(line + k, sizeof(line) - k, "; signal %u, data %u:", sig_length, data_length);
+		for (uint32_t b = 0; b < 48 && b < data_length && k < (int)sizeof(line) - 4; b++) {
+			k += snprintf(line + k, sizeof(line) - k, "%s%02x", b % 4 ? "" : " ", data[b]);
+		}
+		size_t n = strlen(scan_debug);
+		snprintf(scan_debug + n, sizeof(scan_debug) - n, "%s\n", line);
+	}
+	/* the data: the 802.11 frame (beacon 0x80 or probe response 0x50): BSSID at 16, fixed fields to 36, elements */
+	if (data_length < 36 || (data[0] != 0x80 && data[0] != 0x50)) {
+		return;
+	}
+	const uint8_t *bssid = data + 16;
+	uint32_t i;
+	for (i = 0; i < scan_count; i++) {
+		if (memcmp(scan_seen[i].bssid, bssid, 6) == 0) {
+			break;
+		}
+	}
+	if (i == scan_count) {
+		if (scan_count == SCAN_MAX) {
+			return;
+		}
+		scan_count++;
+		bzero(&scan_seen[i], sizeof(scan_seen[i]));
+		memcpy(scan_seen[i].bssid, bssid, 6);
+	}
+	scan_seen[i].mhz = (uint16_t)((sig[12] | sig[13] << 8) / 2);
+	scan_seen[i].rssi = (int16_t)(sig[14] | sig[15] << 8);
+	scan_seen[i].secured = (data[34] & 0x10) != 0;          /* capability: privacy */
+	for (uint32_t e = 36; e + 2 <= data_length && e + 2 + data[e + 1] <= data_length; e += 2 + data[e + 1]) {
+		if (data[e] == 0) {
+			uint32_t n = data[e + 1] < 32 ? data[e + 1] : 32;
+			for (uint32_t k = 0; k < n; k++) {
+				uint8_t c = data[e + 2 + k];
+				scan_seen[i].ssid[k] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+			}
+			scan_seen[i].ssid[n] = 0;
+			break;
+		}
+	}
+}
+
+static void
+step6_take(const uint8_t *sig, uint32_t sig_length, const uint8_t *data, uint32_t data_length)
+{
+	scan_take(sig, sig_length, data, data_length);
+}
+
+/* Step 6: a passive scan over the usual channels. */
+static void
+wifi_step6(vm_offset_t mbox)
+{
+	static const uint16_t channels_5g[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132,
+		                                136, 140, 149, 153, 157, 161, 165 };
+	uint8_t req[36], data[200];
+	uint32_t n = 0;
+
+	vm_offset_t h = wlbt_memory + hip_base;
+	cache_out(h, 512);
+	vm_offset_t config = rd(h + 4) == 5 ? h + HIP_V5 : h + HIP_V4;
+	hip_headroom = *(volatile uint8_t *)(config + 28);
+	hip_tailroom = *(volatile uint8_t *)(config + 29);
+
+	bzero(req, sizeof(req));
+	req[0] = MLME_ADD_SCAN_REQ & 0xff;
+	req[1] = MLME_ADD_SCAN_REQ >> 8;
+	req[4] = FAPI_SENDER & 0xff;
+	req[5] = FAPI_SENDER >> 8;
+	/* vif 0 at 10 (a scan belongs to no interface), scan id at 12: interface 1 << 8 | SLSI_SCAN_HW_ID 0 */
+	req[13] = 1;
+	req[14] = 2;                                    /* FAPI_SCANTYPE_FULL_SCAN */
+	static const uint8_t address[6] = { 0x02, 0xa5, 0x1c, 0x00, 0x00, 0x01 };
+	memcpy(req + 16, address, 6);
+	req[22] = 0x04;                                 /* FAPI_REPORTMODE_REAL_TIME */
+
+	/* no SSIDs: a passive scan. Scan timing: Samsung's defaults (all 0) */
+	static const uint8_t timing[] = { 0xdd, 0x11, 0x00, 0x16, 0x32, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	memcpy(data + n, timing, sizeof(timing));
+	n += sizeof(timing);
+	/* the channel list: frequency * 2 (le16), then the scan policy */
+	uint32_t list = n;
+	static const uint8_t list_header[] = { 0xdd, 0x05, 0x00, 0x16, 0x32, 0x01, 0x02 };
+	memcpy(data + n, list_header, sizeof(list_header));
+	n += sizeof(list_header);
+	for (int c = 1; c <= 13; c++) {
+		uint16_t f = (uint16_t)(2 * (2407 + 5 * c));
+		data[n++] = f & 0xff;
+		data[n++] = f >> 8;
+		data[n++] = 0x01;                       /* FAPI_SCANPOLICY_PASSIVE */
+	}
+	for (size_t c = 0; c < sizeof(channels_5g) / sizeof(channels_5g[0]); c++) {
+		uint16_t f = (uint16_t)(2 * (5000 + 5 * channels_5g[c]));
+		data[n++] = f & 0xff;
+		data[n++] = f >> 8;
+		data[n++] = 0x01;
+	}
+	data[list + 1] = (uint8_t)(n - list - 2);
+
+	printf("a51wifi: step 6: MLME-ADD-SCAN.req, passive, %u channels (headroom %u, tailroom %u)\n",
+	    (n - list - 7) / 3, hip_headroom, hip_tailroom);
+	hip_send(mbox, 1, req, sizeof(req), data, n);
+
+	for (int ms = 0; ms <= 20000 && !scan_done; ms += 20) {
+		uint32_t got = hip_take(mbox, Q_TH_CTRL, step6_take) + hip_take(mbox, Q_TH_DAT, step6_take);
+		if (scan_cfm > 0 && scan_frames == 0 && ms > 2000) {
+			break;                          /* refused */
+		}
+		if (got == 0) {
+			IOSleep(20);
+		}
+	}
+
+	/* the list, said again with the status */
+	wifi_dump[0] = 0;
+	for (uint32_t i = 0; i < scan_count; i++) {
+		size_t k = strlen(wifi_dump);
+		if (k + 120 > sizeof(wifi_dump)) {
+			break;
+		}
+		snprintf(wifi_dump + k, sizeof(wifi_dump) - k, "a51wifi: network %2u: %02x:%02x:%02x:%02x:%02x:%02x %4u MHz %4d dBm %s \"%s\"\n",
+		    i + 1, scan_seen[i].bssid[0], scan_seen[i].bssid[1], scan_seen[i].bssid[2], scan_seen[i].bssid[3],
+		    scan_seen[i].bssid[4], scan_seen[i].bssid[5], scan_seen[i].mhz, scan_seen[i].rssi,
+		    scan_seen[i].secured ? "secured" : "open   ", scan_seen[i].ssid[0] ? scan_seen[i].ssid : "(hidden)");
+	}
+	if (scan_count == 0) {                          /* nothing read: the raw reports, to see why */
+		size_t k = strlen(wifi_dump);
+		snprintf(wifi_dump + k, sizeof(wifi_dump) - k, "%s", scan_debug);
+	}
+	printf("%s", wifi_dump);
+	wifi_said("step 6: scan %s: MLME-ADD-SCAN.cfm %s%x, %u scan reports, %u networks; other signals: %s",
+	    scan_done ? "done (MLME-SCAN-DONE.ind)" : "not done in 20 s", scan_cfm < 0 ? "none " : "result ",
+	    scan_cfm < 0 ? 0 : scan_cfm, scan_frames, scan_count, scan_ids[0] ? scan_ids : "none");
+}
+
 /* Step 5: MLME-ADD-VIF.req, and what comes back. */
+static bool vif_added;
+
 static void
 wifi_step5(vm_offset_t mbox)
 {
@@ -514,6 +814,7 @@ wifi_step5(vm_offset_t mbox)
 		}
 	}
 	cache_out(h + HIP_SCOREBOARD, 128);
+	vif_added = cfm && result == 0;
 	if (cfm) {
 		wifi_said("step 5: MLME-ADD-VIF.cfm: vif %u, result %#x (%s); signals seen: %s", vif, result,
 		    result == 0 ? "SUCCESS" : "an error", seen);
@@ -869,6 +1170,14 @@ wifi_step2(const uint8_t *fw, uint64_t size)
 			IOSleep(100);
 			wifi_step5(mbox);
 			printf("a51wifi: (step 4 was: %s)\n", started);
+			if (wifi_steps >= 6 && vif_added) {
+				char added[256];
+
+				strlcpy(added, wifi_state, sizeof(added));
+				IOSleep(100);
+				wifi_step6(mbox);
+				printf("a51wifi: (step 5 was: %s)\n", added);
+			}
 		}
 	}
 }
