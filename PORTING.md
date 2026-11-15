@@ -550,3 +550,38 @@ jobs, 0 failed, no panic. So the top levels are safe to ask for with the watch r
   0x0d03 (13.3), test 0x0e00 (14.0); headroom 248 and tailroom 26 for MA-UNITDATA. Next, step 5: HIP4 signalling
   (mbulk blocks in the transmit pools, the from-host control queue and the scoreboard, from-host bit 5; replies on the
   to-host queues with bit 7) to send a first MLME request, then a scan.
+
+### HIP4 signalling, research (2026-11-15)
+
+- After SM_MSG_START_CFM, Samsung's hip4_setup takes the config version the firmware chose (4 here), its unitdata head-
+  and tailroom, and unmasks the to-host bit. From then on the host handles HIP4 interrupts.
+- A request (scsc_wifi_transmit_frame): a transmit block from the control pool (64 KB at HIP+0x10a000; 32 slots of
+  2 KB) holding a struct mbulk (next offset, flags, class, pool id, refcount, data / signal buffer sizes, length, head,
+  chain offset), then the signal (fapi_signal_header: id, receiver PID, sender PID, firmware reference, then the
+  signal's fields), 4 bytes into the signal buffer; any payload in the data buffer after it. Its offset goes into the
+  from-host control queue (q[0].array[write]); the write index (one byte at scoreboard + 0) moves on; from-host bit 5
+  is raised (INTGR1).
+- Scoreboard bytes: the host owns 0 (FH_CTRL write), 1 (FH_DAT write), 2 (FH_RFB read), 3 (TH_CTRL read), 4 (TH_DAT
+  read), 5 (TH_RFB write); the firmware owns the same queues' other index at 64..69.
+- Still to read for step 5: mbulk_with_signal_alloc's layout, the FAPI signal ids and the MIB get encoding (fapi.h,
+  mib.c) for a first MLME-GET.request, and the receive path (to-host control queue entries are offsets of the
+  firmware's blocks; returning them goes through the to-host RFB queue).
+
+### WiFi step 5: first MLME request (WORKS: MLME-ADD-VIF.cfm vif 1, result SUCCESS)
+
+`a51wifi=5` sends MLME-ADD-VIF.req (0x2007; vif 1, station, address 02:a5:1c:00:00:01, sender PID 0xc001) after
+SM_MSG_START_CFM. The signal goes in control-pool block 0 (HIP + 0x10a000): mbulk descriptor 20 bytes, because
+mbulk_class is a packed enum (1 byte): flag 4 = 1, class 5 = 5, pool 6 = 1, data size 8, sig_bufsz 10 =
+round_up(20 + 4 + len, 4) - 20, len 12, head 14 = sig_bufsz, chain 16; FAPI signal at +20+4. First try with a 23-byte
+layout (class as 4 bytes): the firmware panicked 0x2a01 COMMON_HOSTIO_GENERIC; panic record word 2 is the offset of
+its log string in log-strings.bin (mif_q.c:378), word 13 the block's firmware address (0x80000000 + offset).
+With 20 bytes the same panic came back, now with the right head and size (words 9, 10). Disassembly of mx140.bin
+(llvm-objdump --triple=thumbv7r, file offset = firmware address - 0x80000000; the panic string's offset is a literal
+next to the check) showed the check: (flag & 0x24) must be 4, i.e. MBULK_F_OBOUND set and MBULK_F_FREE clear. Samsung's
+hip4_skb_to_mbulk() ends with m->flag |= MBULK_F_OBOUND; flag is 0x05. Its offset
+goes into FH_CTRL at scoreboard byte 0, then from-host bit 5. For 3 s every TH_CTRL entry (host read byte 3,
+firmware write byte 67) is logged and handed back through TH_RFB (byte 5); a received signal also starts 4 bytes
+into the block's signal buffer (hip4_mbulk_to_skb). Expected: MLME-ADD-VIF.cfm 0x2107, result 0.
+Result on the phone (2026-11-15): seven DebugWord12_indication (0x8301) and then MLME-ADD-VIF.cfm (0x2107), vif 1,
+result 0. Every to-host block was handed back through TH_RFB without complaint. Signal names are in
+fw-wifi-a51/debug/symbols.dbg (section "signalid").

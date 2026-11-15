@@ -39,11 +39,17 @@
  *              after step 3's, SM_MSG_START_REQ for service 1 (WLAN) sent on management channel 1 with the region's
  *              offset, and the firmware's SM_MSG_START_CFM waited for; then what it filled into the config read
  *
+ *   5  after SM_MSG_START_CFM: a first MLME request over HIP4, MLME-ADD-VIF.req (interface 1, a station, a locally
+ *              administered address), in an mbulk of the control pool put on the from-host control queue (scoreboard
+ *              byte 0, from-host bit 5); every to-host control signal of the next 3 s logged and handed back (the to-host
+ *              RFB queue), up to MLME-ADD-VIF.cfm
+ *
  * What the steps found is said again every 30 s for five minutes: a whole system's start pushes the first lines out of
  * the kernel log.
  *
- * Status: steps 1 to 4 run on the phone (2026-11-15): the firmware starts (MM_START_IND) and so does the WLAN service
- * (SM_MSG_START_CFM, SAP MLME 14.7 / MA 14.1, as on Android). Not yet: HIP4 signalling (MLME requests: scan, connect).
+ * Status: steps 1 to 5 run on the phone (2026-11-15): the firmware starts (MM_START_IND) and so does the WLAN service
+ * (SM_MSG_START_CFM, SAP MLME 14.7 / MA 14.1, as on Android); HIP4 signalling works both ways (MLME-ADD-VIF.req answered
+ * by MLME-ADD-VIF.cfm, SUCCESS). Not yet: scan, connect, packets.
  */
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -314,7 +320,7 @@ w32(vm_offset_t a, uint32_t v)
 
 static void cache_out(vm_offset_t start, vm_size_t size);
 static uint32_t runtime_panic_offset;          /* the firmware's R4 panic record, from its header (step 3) */
-static char wifi_dump[2600];                    /* hex of the panic record and the log ring, said again with the status */
+static char wifi_dump[7000];                    /* hex of the panic record and the log ring, said again with the status */
 
 /* Words as hex lines into wifi_dump (16 a line, each line tagged), for the log that keeps only its end. */
 static void
@@ -392,11 +398,168 @@ hcf_payload(const uint8_t *data, uint64_t length, uint32_t *out_length)
 	return data;
 }
 
+/*
+ * Step 5's signalling, as Samsung's hip4.c and mbulk.c do it. An mbulk is a 20-byte descriptor (packed; its class is a
+ * packed enum, one byte): next offset 0, flag 4 (1: a signal follows), class 5, pool id 6, refcount 7, data size 8,
+ * signal size 10, length 12, head 14, chain offset 16; the signal buffer right after it, the FAPI signal 4 bytes into
+ * it. (A 23-byte layout, the class taken as 4 bytes, made the firmware panic in mif_q.c:378, HOSTIO_GENERIC.) The scoreboard keeps each queue's indices as single bytes: the host's at
+ * 0..5 (FH_CTRL write, FH_DAT write, FH_RFB read, TH_CTRL read, TH_DAT read, TH_RFB write), the firmware's at 64..69.
+ */
+#define MBULK_DESC              20
+#define MBULK_POOL_CTRL         1
+#define MBULK_CLASS_FROM_HOST_CTL 5
+#define HIP_TX_CTL              0x10a000        /* the control pool: 32 blocks of 2 KB */
+#define Q_FH_CTRL               0
+#define Q_TH_CTRL               3
+#define Q_TH_RFB                5
+#define MLME_ADD_VIF_REQ        0x2007
+#define MLME_ADD_VIF_CFM        0x2107
+#define FAPI_SENDER             0xc001          /* SLSI_TX_PROCESS_ID_MIN */
+
+static uint32_t hip_base;                       /* step 4's region, as an offset in the 16 MB */
+
+/* Put a FAPI signal (no payload) into control block `block` and onto the from-host control queue. */
+static void
+hip_send_signal(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_t length)
+{
+	vm_offset_t h = wlbt_memory + hip_base, m = h + HIP_TX_CTL + block * 2048;
+	uint32_t sig_bufsz = ((MBULK_DESC + length + 4 + 3) & ~3u) - MBULK_DESC;
+
+	bzero((void *)m, 2048);
+	w8(m + 4, 1 | 4);                               /* MBULK_F_SIG | MBULK_F_OBOUND (the firmware checks it: mif_q.c) */
+	w8(m + 5, MBULK_CLASS_FROM_HOST_CTL);
+	w8(m + 6, MBULK_POOL_CTRL);
+	w16(m + 10, (uint16_t)sig_bufsz);
+	w16(m + 14, (uint16_t)sig_bufsz);               /* head: no data after the signal */
+	memcpy((void *)(m + MBULK_DESC + 4), signal, length);
+	cache_out(m, 2048);
+
+	cache_out(h + HIP_SCOREBOARD, 128);
+	uint8_t w = *(volatile uint8_t *)(h + HIP_SCOREBOARD + 0);
+	w32(h + HIP_QUEUE(Q_FH_CTRL) + 4 * w, hip_base + HIP_TX_CTL + block * 2048);
+	cache_out(h + HIP_QUEUE(Q_FH_CTRL) + 4 * w, 4);
+	w8(h + HIP_SCOREBOARD + 0, (uint8_t)(w + 1));
+	cache_out(h + HIP_SCOREBOARD, 4);
+	wr(mbox + MBOX_INTGR1, 1u << HIP_FROMHOST_BIT);
+}
+
+/* Step 5: MLME-ADD-VIF.req, and what comes back. */
+static void
+wifi_step5(vm_offset_t mbox)
+{
+	vm_offset_t h = wlbt_memory + hip_base;
+	uint8_t req[38];
+	static const uint8_t address[6] = { 0x02, 0xa5, 0x1c, 0x00, 0x00, 0x01 };       /* locally administered */
+	char seen[200] = "";
+	bool cfm = false;
+	uint16_t result = 0xffff, vif = 0;
+
+	vm_offset_t mx = wlbt_memory + mx_heap;
+
+	/* the firmware's log stream (read index 0x9000, write 0x9004, ring at 0x5000): never read so far; caught up here */
+	cache_out(mx + 0x9000, 8);
+	uint32_t log_r = rd(mx + 0x9000), log_w = rd(mx + 0x9004);
+	w32(mx + 0x9000, log_w);
+	cache_out(mx + 0x9000, 8);
+	printf("a51wifi: step 5: MLME-ADD-VIF.req over HIP4 (log stream was %u/%u, caught up)\n", log_r, log_w);
+	bzero(req, sizeof(req));
+	req[0] = MLME_ADD_VIF_REQ & 0xff;
+	req[1] = MLME_ADD_VIF_REQ >> 8;
+	req[4] = FAPI_SENDER & 0xff;                     /* receiver PID 0 at 2, sender at 4, firmware reference 0 at 6 */
+	req[5] = FAPI_SENDER >> 8;
+	req[10] = 1;                                     /* vif 1 */
+	memcpy(req + 12, address, 6);                    /* interface address */
+	req[18] = 2;                                     /* FAPI_VIFTYPE_STATION */
+	memcpy(req + 20, address, 6);                    /* device address */
+	hip_send_signal(mbox, 0, req, sizeof(req));
+
+	/* the to-host control queue, for 3 s: every signal logged and its block handed back */
+	for (int ms = 0; ms <= 3000 && !cfm; ms += 10) {
+		cache_out(h + HIP_SCOREBOARD, 128);
+		uint8_t r = *(volatile uint8_t *)(h + HIP_SCOREBOARD + Q_TH_CTRL);
+		uint8_t fw_w = *(volatile uint8_t *)(h + HIP_SCOREBOARD + 64 + Q_TH_CTRL);
+
+		while (r != fw_w) {
+			cache_out(h + HIP_QUEUE(Q_TH_CTRL) + 4 * r, 4);
+			uint32_t ref = rd(h + HIP_QUEUE(Q_TH_CTRL) + 4 * r);
+			if (ref >= WLBT_MEMORY - 256) {
+				break;
+			}
+			vm_offset_t m = wlbt_memory + ref;
+			cache_out(m, 256);
+			const uint8_t *sig = (const uint8_t *)(m + MBULK_DESC + 4);
+			uint16_t id = sig[0] | sig[1] << 8;
+			size_t n = strlen(seen);
+			snprintf(seen + n, sizeof(seen) - n, "%04x ", id);
+			printf("a51wifi: to host: signal %04x (receiver %04x, sender %04x), %02x %02x %02x %02x %02x %02x %02x %02x\n", id,
+			    sig[2] | sig[3] << 8, sig[4] | sig[5] << 8, sig[10], sig[11], sig[12], sig[13], sig[14], sig[15], sig[16],
+			    sig[17]);
+			if (id == MLME_ADD_VIF_CFM) {
+				vif = sig[10] | sig[11] << 8;
+				result = sig[12] | sig[13] << 8;
+				cfm = true;
+			}
+			/* handed back: onto the to-host RFB queue */
+			uint8_t rw = *(volatile uint8_t *)(h + HIP_SCOREBOARD + Q_TH_RFB);
+			w32(h + HIP_QUEUE(Q_TH_RFB) + 4 * rw, ref);
+			cache_out(h + HIP_QUEUE(Q_TH_RFB) + 4 * rw, 4);
+			w8(h + HIP_SCOREBOARD + Q_TH_RFB, (uint8_t)(rw + 1));
+			r++;
+			w8(h + HIP_SCOREBOARD + Q_TH_CTRL, r);
+			cache_out(h + HIP_SCOREBOARD, 8);
+			wr(mbox + MBOX_INTGR1, 1u << HIP_FROMHOST_BIT);
+		}
+		if (!cfm) {
+			IOSleep(10);
+		}
+	}
+	cache_out(h + HIP_SCOREBOARD, 128);
+	if (cfm) {
+		wifi_said("step 5: MLME-ADD-VIF.cfm: vif %u, result %#x (%s); signals seen: %s", vif, result,
+		    result == 0 ? "SUCCESS" : "an error", seen);
+	} else {
+		/* what the firmware did: its panic record, the to-AP ring, the newest 512 words of its log */
+		char slots[160] = "";
+		wifi_dump[0] = 0;
+		if (runtime_panic_offset != 0 && runtime_panic_offset + 256 < WLBT_MEMORY) {
+			cache_out(wlbt_memory + runtime_panic_offset, 256);
+			dump_words("panic", (const uint32_t *)(wlbt_memory + runtime_panic_offset), 32);
+		}
+		cache_out(mx + MX_TOAP_RIDX, 8);
+		cache_out(mx + MX_TOAP_RING, MX_PACKETS * MX_PACKET_SIZE);
+		for (int i = 0; i < MX_PACKETS; i++) {
+			const uint8_t *sl = (const uint8_t *)(mx + MX_TOAP_RING + i * MX_PACKET_SIZE);
+			size_t n = strlen(slots);
+			snprintf(slots + n, sizeof(slots) - n, "[%02x %02x %02x %02x %02x %02x] ", sl[0], sl[1], sl[2], sl[3], sl[4], sl[5]);
+		}
+		cache_out(mx + 0x9000, 8);
+		cache_out(mx + 0x5000, 0x4000);
+		uint32_t now_w = rd(mx + 0x9004), from = now_w > 512 ? now_w - 512 : 0;
+		if (now_w <= 0x1000) {
+			dump_words("log", (const uint32_t *)(mx + 0x5000 + 4 * from), now_w - from);
+		}
+		printf("%s", wifi_dump);
+		printf("a51wifi: step 5 detail: to-AP ring %u/%u slots %s; log stream now %u/%u (dump from word %u)\n",
+		    rd(mx + MX_TOAP_RIDX), rd(mx + MX_TOAP_WIDX), slots, rd(mx + 0x9000), now_w, from);
+		wifi_said("step 5: no MLME-ADD-VIF.cfm in 3 s; signals seen: %s; scoreboard host %02x %02x %02x %02x %02x %02x, firmware "
+		    "%02x %02x %02x %02x %02x %02x; mailbox ISSR0 %x INTSR0 %x", seen[0] ? seen : "none",
+		    *(volatile uint8_t *)(h + HIP_SCOREBOARD + 0), *(volatile uint8_t *)(h + HIP_SCOREBOARD + 1),
+		    *(volatile uint8_t *)(h + HIP_SCOREBOARD + 2), *(volatile uint8_t *)(h + HIP_SCOREBOARD + 3),
+		    *(volatile uint8_t *)(h + HIP_SCOREBOARD + 4), *(volatile uint8_t *)(h + HIP_SCOREBOARD + 5),
+		    *(volatile uint8_t *)(h + HIP_SCOREBOARD + 64), *(volatile uint8_t *)(h + HIP_SCOREBOARD + 65),
+		    *(volatile uint8_t *)(h + HIP_SCOREBOARD + 66), *(volatile uint8_t *)(h + HIP_SCOREBOARD + 67),
+		    *(volatile uint8_t *)(h + HIP_SCOREBOARD + 68), *(volatile uint8_t *)(h + HIP_SCOREBOARD + 69),
+		    rd(mbox + MBOX_ISSR(0)), rd(mbox + MBOX_INTSR0));
+	}
+}
+
 /* Step 4: the region built, the WLAN service asked to start. false: no answer. */
 static bool
 wifi_step4(vm_offset_t mbox, uint32_t heap_end)
 {
 	uint32_t hip_ref = (heap_end + 0xfff) & ~0xfffu;
+
+	hip_base = hip_ref;
 	vm_offset_t h = wlbt_memory + hip_ref, mx = wlbt_memory + mx_heap;
 	const uint8_t *mib[2];
 	uint64_t mib_len[2] = { 0, 0 };
@@ -699,7 +862,14 @@ wifi_step2(const uint8_t *fw, uint64_t size)
 	    widx);
 	if (start_ind && wifi_steps >= 4) {
 		IOSleep(100);
-		wifi_step4(mbox, mx_heap + MX_HEAP_SIZE);
+		if (wifi_step4(mbox, mx_heap + MX_HEAP_SIZE) && wifi_steps >= 5) {
+			char started[256];
+
+			strlcpy(started, wifi_state, sizeof(started));
+			IOSleep(100);
+			wifi_step5(mbox);
+			printf("a51wifi: (step 4 was: %s)\n", started);
+		}
 	}
 }
 
