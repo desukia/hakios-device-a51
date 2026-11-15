@@ -500,3 +500,53 @@ jobs, 0 failed, no panic. So the top levels are safe to ask for with the watch r
   Next: the WLAN service. It's started over the service-management channel (srvman / servman_messages.h, channel 1),
   then Samsung's slsi driver speaks HIP4 with the firmware over shared memory: MIBs (the .hcf config), MLME requests
   (scan, connect) and data frames.
+
+### WLAN service, research (2026-11-15)
+
+- A service starts with one message on management channel 1 (service management, servman_messages.h): service id
+  (SCSC_SERVICE_ID_WLAN = 1), SM_MSG_START_REQ (0), and a 32-bit offset in the 16 MB pointing at the service's own
+  configuration; the firmware answers SM_MSG_START_CFM (1) on the same channel. Sending means writing a 128-byte packet
+  into the from-AP management ring, moving its write index and raising from-host bit 2 (INTGR1).
+- WLAN's configuration is the HIP4 region (drivers/net/wireless/scsc/hip4.h, copies in ref/slsi): about 2.1 MB in the
+  shared memory. At its start, an 8 KB config area (struct hip4_hip_config_version_4/5: magic 0xcaba0401, version,
+  length; firmware-filled API versions and build; host-filled buffer locations, the MIB location and size, interrupt
+  bits, a scoreboard of queue indices and six 256-entry queues: control, data and receive-buffer, each direction). Then
+  32 KB for the MIB (the WiFi configuration: the .hcf files), 1 MB of transmit data blocks and 64 KB of transmit
+  control blocks (mbulk pools), and 512 KB or 1 MB for receive.
+- Plan, step 4: lay out the HIP4 region after the mxconf layout (it fits in the first 8 MB beside the 3.5 MB of
+  firmware), fill the host side of the config, put mx140_wlan.hcf (+ _sw.hcf) into the MIB area, send
+  SM_MSG_START_REQ for WLAN, and wait for SM_MSG_START_CFM (and the firmware's fields filled in the config). After
+  that, step 5: Samsung's HIP4 signalling (mbulk + queues) to send the first MLME request (a scan).
+- Step 4 written (built, not yet run): the HIP4 region (0x21a000 bytes on the A51: no PCIe so 1 MB receive, no RX NAPI
+  so one to-host bit for all queues, SMAPPER built in so config v4 is 227 bytes) after step 3's layout, 4 KB aligned.
+  Control area as struct hip4_hip_control: init 0 (magic 0xcaaa0400; refs to config v4 at 160 and v5 at 32), scoreboard
+  448, queues 1472 + n·1088. MIB = mx140_wlan.hcf then mx140_wlan_sw.hcf, unchanged (Samsung only hashes the header).
+  Interrupt bits: to-host 7, from-host 5 (the next free after step 3's streams). Then SM_MSG_START_REQ (channel 1,
+  service 1, message 0, the region's offset) into the from-AP ring with from-host bit 2, and SM_MSG_START_CFM awaited;
+  the firmware's chosen config version and its fields (SAP versions, build) are read back.
+- Step 4 on the phone (2026-11-15): the firmware took SM_MSG_START_REQ (from-AP ring read index 0 → 1) and accepted the
+  HIP4 config (it wrote 4 into init.conf_hip4_ver: version 4). Mailbox 0 went to 0x11110011. But no SM_MSG_START_CFM in
+  3 s, which is also Samsung's timeout. Added diagnostics for the next run: wait 10 s, then the panic record, all four
+  to-AP slots, config v4's firmware-filled fields, and the log stream's indices and first words.
+- Step 4 diagnostics (2026-11-15): the firmware **panicked** while starting WLAN. Its R4 panic record (format version 2,
+  212 bytes) starts 2 d4 a8ff4 25002ae5 d 0 2090a2 11187. Mailbox INTSR0 0x420000: to-host bit 1 (it read our request)
+  and bit 6 (the log stream: 152 entries written). Config v4: SAP MLME 0x0e07 filled, build 0. Samsung's driver only
+  dumps a panic record (and checks its XOR checksum, seed 0xa5a5a5a5); it doesn't decode the fields. Next run dumps the
+  whole record and the log ring as hex, repeated with the status. To decode the log: each entry is
+  sync|level|len, timestamp, an offset into /vendor/etc/wifi/mx140/debug/log_strings.bin (the firmware's format
+  strings; pull it from Android), then arguments (mxlog.c).
+- The firmware's log, decoded (2026-11-15; log-strings.bin from /vendor/etc/wifi/mx140/debug/common, decoder in the
+  session scratchpad; decoded copy logs/wifi-log-decoded.txt): APM IPC set up, chip version 0xa4800000, "WLBT
+  Initialized early power via APM", LDOs; on our request "Received SM_MSG_START_REQ for service: 1", "Starting service:
+  1", "WLBT RFIC LDOs setup via APM", then the panic, with no message of its own.
+- Android's own WLAN start, for comparison (WiFi toggled off and on, dmesg): the same two .hcf files and the same HIP4
+  sizes, but it loads only 4266 + 204 bytes of MIB, and SM_MSG_START_CFM comes 180 ms after the start, with SAP versions
+  MLME 14.7, MA 14.1, debug 13.3, test 14.0. The difference: Samsung's slsi_mib_open_file skips each file's 8-byte
+  header, and slsi_mib_get_platform then skips the leading platform keys (0xfffe version, 0xffff platform-name string,
+  padded to 16 bits): 60 and 80 bytes. HakiOS loaded the files whole, so the firmware read header and platform text as
+  configuration. Fixed (hcf_payload()); built, not yet run.
+- Step 4 with the trimmed MIB (2026-11-15): **SM_MSG_START_CFM: the WLAN service runs.** MIB 4470 bytes (as Android),
+  config version 4 taken, and the firmware's SAP versions are Android's: MLME 0x0e07 (14.7), MA 0x0e01 (14.1), debug
+  0x0d03 (13.3), test 0x0e00 (14.0); headroom 248 and tailroom 26 for MA-UNITDATA. Next, step 5: HIP4 signalling
+  (mbulk blocks in the transmit pools, the from-host control queue and the scoreboard, from-host bit 5; replies on the
+  to-host queues with bit 7) to send a first MLME request, then a scan.

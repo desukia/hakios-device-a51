@@ -33,11 +33,17 @@
  *              MM_START_IND (channel 0, message 0, its argument the WLBT hardware revision). Without it, the firmware's
  *              panic record (fwhdr r4_panic_record_offset) is read
  *
+ *   4  after MM_START_IND: the WLAN service's HIP4 region (drivers/net/wireless/scsc/hip4.h: 8 KB of control --
+ *              struct hip4_hip_control: init, config versions 5 and 4, scoreboard, six queues -- then 32 KB of MIB,
+ *              the two .hcf files one after the other, 1 MB + 64 KB of transmit and 1 MB of receive space) laid out
+ *              after step 3's, SM_MSG_START_REQ for service 1 (WLAN) sent on management channel 1 with the region's
+ *              offset, and the firmware's SM_MSG_START_CFM waited for; then what it filled into the config read
+ *
  * What the steps found is said again every 30 s for five minutes: a whole system's start pushes the first lines out of
  * the kernel log.
  *
- * Status: steps 1 to 3 run on the phone (2026-11-15): the firmware starts and sends MM_START_IND (arg 0). Not yet:
- * the WLAN service (service management, then the slsi driver's HIP4).
+ * Status: steps 1 to 4 run on the phone (2026-11-15): the firmware starts (MM_START_IND) and so does the WLAN service
+ * (SM_MSG_START_CFM, SAP MLME 14.7 / MA 14.1, as on Android). Not yet: HIP4 signalling (MLME requests: scan, connect).
  */
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -264,6 +270,270 @@ cache_out(vm_offset_t start, vm_size_t size)
 	__asm__ volatile ("dsb sy");
 }
 
+/*
+ * Step 4's region, hip4.h on the A51 (no PCIe, no RX NAPI, SMAPPER built in): control 0x0000 (8 KB), MIB 0x2000 (32 KB),
+ * transmit 0xa000 (1 MB of data blocks, 64 KB of control blocks), receive 0x11a000 (1 MB): 0x21a000 in all. Inside the
+ * control area (struct hip4_hip_control): init at 0 (magic 0xcaaa0400, the version the firmware takes at 4, then the
+ * locations of config A = version 4 and B = version 5), config v5 at 32, config v4 at 160 (227 bytes, packed), the
+ * scoreboard at 448 (256 words), the queues at 1472 + n * 1088 (256 words, then read / write / total bytes, 64-aligned).
+ * The interrupt bits are the next Samsung's allocator would give after the seven streams of step 3: to-host 7 (one
+ * for every queue, without RX NAPI), from-host 5.
+ */
+#define HIP_CONTROL             0x000000
+#define HIP_MIB                 0x002000
+#define HIP_MIB_SIZE            0x008000
+#define HIP_TX                  0x00a000
+#define HIP_TX_SIZE             0x110000
+#define HIP_RX                  0x11a000
+#define HIP_RX_SIZE             0x100000
+#define HIP_TOTAL               0x21a000
+#define HIP_V5                  32
+#define HIP_V4                  160
+#define HIP_SCOREBOARD          448
+#define HIP_QUEUE(n)            (1472 + (n) * 1088)
+#define HIP_TOHOST_BIT          7
+#define HIP_FROMHOST_BIT        5
+
+static inline void
+w8(vm_offset_t a, uint8_t v)
+{
+	*(volatile uint8_t *)a = v;
+}
+
+static inline void
+w16(vm_offset_t a, uint16_t v)
+{
+	*(volatile uint16_t *)a = v;
+}
+
+static inline void
+w32(vm_offset_t a, uint32_t v)
+{
+	*(volatile uint32_t *)a = v;
+}
+
+static void cache_out(vm_offset_t start, vm_size_t size);
+static uint32_t runtime_panic_offset;          /* the firmware's R4 panic record, from its header (step 3) */
+static char wifi_dump[2600];                    /* hex of the panic record and the log ring, said again with the status */
+
+/* Words as hex lines into wifi_dump (16 a line, each line tagged), for the log that keeps only its end. */
+static void
+dump_words(const char *tag, const uint32_t *w, uint32_t count)
+{
+	for (uint32_t i = 0; i < count; i += 16) {
+		size_t n = strlen(wifi_dump);
+
+		if (n + 200 > sizeof(wifi_dump)) {
+			return;
+		}
+		n += snprintf(wifi_dump + n, sizeof(wifi_dump) - n, "a51wifi: dump %s %03x:", tag, i * 4);
+		for (uint32_t j = i; j < i + 16 && j < count; j++) {
+			n += snprintf(wifi_dump + n, sizeof(wifi_dump) - n, " %08x", w[j]);
+		}
+		snprintf(wifi_dump + n, sizeof(wifi_dump) - n, "\n");
+	}
+}
+
+/* The host's half of a config (the same for both versions up to log_config_sz, at 64 bytes in). */
+static void
+hip_config_common(vm_offset_t c, uint32_t hip_ref, uint16_t version, uint16_t length, uint32_t mib_size)
+{
+	w32(c + 0, 0xcaba0401);
+	w16(c + 4, version);
+	w16(c + 6, length);
+	w8(c + 31, 64);                         /* host_cache_line */
+	w32(c + 32, hip_ref + HIP_TX);          /* host_buf_loc */
+	w32(c + 36, HIP_TX_SIZE);
+	w32(c + 40, hip_ref + HIP_RX);          /* fw_buf_loc */
+	w32(c + 44, HIP_RX_SIZE);
+	w32(c + 48, mib_size ? hip_ref + HIP_MIB : 0);
+	w32(c + 52, mib_size);
+	w32(c + 56, 0);                         /* log_config_loc */
+	w32(c + 60, 0);
+}
+
+/*
+ * What of an .hcf file the firmware is given, as Samsung's slsi_mib_open_file and slsi_mib_get_platform cut it: the
+ * 8-byte header off (its last byte 1: the first file format), then, when the payload starts with key 0xfffe (version
+ * 1) and key 0xffff (the platform name, a vldata string: a 0xa0-type header octet whose low bits give the size of a
+ * length field after it), those keys off as well, the string padded to 16 bits. On this phone: 60 bytes off
+ * mx140_wlan.hcf (4326 -> 4266), 80 off mx140_wlan_sw.hcf (284 -> 204), as Android's log says it loads them.
+ */
+static const uint8_t *
+hcf_payload(const uint8_t *data, uint64_t length, uint32_t *out_length)
+{
+	if (data == NULL || length < 8 || data[7] != 1) {
+		*out_length = 0;
+		return NULL;
+	}
+	data += 8;
+	length -= 8;
+	if (length >= 12 && data[0] == 0xfe && data[1] == 0xff && data[2] == 0x01 && data[3] == 0x00 && data[4] == 0x01 &&
+	    data[5] == 0x00 && data[6] == 0xff && data[7] == 0xff) {
+		uint32_t pos = 8, name = data[pos] | (uint32_t)data[pos + 1] << 16;
+
+		pos += 2;
+		if (name >= 2 && pos + name <= length && (data[pos] & 0xa0) && (data[pos] & 0x17) <= 2) {
+			uint32_t field = data[pos] & 0x17;
+
+			pos += 1;
+			name -= 1;
+			pos += field;
+			name -= field;
+			name += name & 1;
+			pos += name;
+			if (pos <= length) {
+				data += pos;
+				length -= pos;
+			}
+		}
+	}
+	*out_length = (uint32_t)length;
+	return data;
+}
+
+/* Step 4: the region built, the WLAN service asked to start. false: no answer. */
+static bool
+wifi_step4(vm_offset_t mbox, uint32_t heap_end)
+{
+	uint32_t hip_ref = (heap_end + 0xfff) & ~0xfffu;
+	vm_offset_t h = wlbt_memory + hip_ref, mx = wlbt_memory + mx_heap;
+	const uint8_t *mib[2];
+	uint64_t mib_len[2] = { 0, 0 };
+	uint32_t mib_size = 0;
+
+	printf("a51wifi: step 4: the WLAN service's HIP4 region at %x (%u bytes), SM_MSG_START_REQ\n", hip_ref, HIP_TOTAL);
+	if (hip_ref + HIP_TOTAL > (8u << 20)) {
+		wifi_said("step 4: the HIP4 region would end past the first 8 MB (%x): stopping", hip_ref + HIP_TOTAL);
+		return false;
+	}
+	mib[0] = hakios_image_file("fw", "mx140_wlan.hcf", &mib_len[0], NULL);
+	mib[1] = hakios_image_file("fw", "mx140_wlan_sw.hcf", &mib_len[1], NULL);
+	bzero((void *)h, HIP_MIB + HIP_MIB_SIZE);
+	uint32_t part[2] = { 0, 0 };
+	for (int i = 0; i < 2; i++) {
+		const uint8_t *payload = hcf_payload(mib[i], mib_len[i], &part[i]);
+
+		if (payload != NULL && mib_size + part[i] <= HIP_MIB_SIZE) {
+			memcpy((void *)(h + HIP_MIB + mib_size), payload, part[i]);
+			mib_size += part[i];
+		}
+	}
+	printf("a51wifi: MIB: %u + %u bytes of the two .hcf files (of %llu and %llu)\n", part[0], part[1], mib_len[0], mib_len[1]);
+
+	/* config v5 (B) and v4 (A), then init pointing at both */
+	vm_offset_t v5 = h + HIP_V5, v4 = h + HIP_V4;
+	hip_config_common(v5, hip_ref, 5, 120, mib_size);
+	w8(v5 + 64, HIP_FROMHOST_BIT);
+	w8(v5 + 65, HIP_TOHOST_BIT);
+	w32(v5 + 68, hip_ref + HIP_SCOREBOARD);
+	w16(v5 + 72, 6);
+	w16(v5 + 74, 256);
+	w16(v5 + 76, 1);
+	hip_config_common(v4, hip_ref, 4, 227, mib_size);
+	w8(v4 + 64, HIP_FROMHOST_BIT);
+	for (int q = 0; q < 6; q++) {
+		w8(v4 + 68 + q, HIP_TOHOST_BIT);
+	}
+	w32(v4 + 76, hip_ref + HIP_SCOREBOARD);
+	w16(v4 + 80, 6);
+	w16(v4 + 82, 256);
+	w16(v4 + 84, 1);
+	for (int q = 0; q < 6; q++) {
+		w32(v5 + 80 + 4 * q, hip_ref + HIP_QUEUE(q));
+		w32(v4 + 88 + 4 * q, hip_ref + HIP_QUEUE(q));
+	}
+	w32(h + 0, 0xcaaa0400);
+	w32(h + 8, hip_ref + HIP_V4);           /* version_a_ref */
+	w32(h + 12, hip_ref + HIP_V5);          /* version_b_ref */
+	cache_out(h, HIP_MIB + HIP_MIB_SIZE);
+
+	/* SM_MSG_START_REQ: channel 1 (service management), service 1 (WLAN), message 0, the region's offset */
+	cache_out(mx + MX_FROMAP_RIDX, 8);
+	uint32_t fw_slot = rd(mx + MX_FROMAP_WIDX) % MX_PACKETS;
+	vm_offset_t packet = mx + MX_FROMAP_RING + fw_slot * MX_PACKET_SIZE;
+	bzero((void *)packet, MX_PACKET_SIZE);
+	w8(packet + 0, 1);
+	w8(packet + 1, 1);
+	w8(packet + 2, 0);
+	w8(packet + 3, (uint8_t)hip_ref);
+	w8(packet + 4, (uint8_t)(hip_ref >> 8));
+	w8(packet + 5, (uint8_t)(hip_ref >> 16));
+	w8(packet + 6, (uint8_t)(hip_ref >> 24));
+	cache_out(packet, MX_PACKET_SIZE);
+	w32(mx + MX_FROMAP_WIDX, (fw_slot + 1) % MX_PACKETS);
+	cache_out(mx + MX_FROMAP_WIDX, 4);
+	wr(mbox + MBOX_INTGR1, 1u << 2);        /* the from-AP management stream's write bit */
+
+	/* the answer: SM_MSG_START_CFM in the to-AP ring */
+	uint32_t ridx = 0, widx = 0;
+	for (int ms = 0; ms <= 10000; ms += 10) {     /* Samsung waits 3 s; longer here, to see whether it comes late */
+		cache_out(mx + MX_TOAP_RIDX, 8);
+		ridx = rd(mx + MX_TOAP_RIDX);
+		widx = rd(mx + MX_TOAP_WIDX);
+		if (widx != ridx) {
+			break;
+		}
+		IOSleep(10);
+	}
+	cache_out(h, HIP_V4 + 227);
+	uint32_t taken = rd(h + 4);
+	if (widx == ridx) {
+		/* what there is to see: the panic record, every to-AP slot, what the firmware filled in, its log stream */
+		char panic[120] = "", slots[160] = "";
+		uint32_t panic_offset = runtime_panic_offset;
+		if (panic_offset != 0 && panic_offset + 32 < WLBT_MEMORY) {
+			cache_out(wlbt_memory + panic_offset, 32);
+			uint32_t *pr = (uint32_t *)(wlbt_memory + panic_offset);
+			snprintf(panic, sizeof(panic), "%x %x %x %x %x %x %x %x", pr[0], pr[1], pr[2], pr[3], pr[4], pr[5], pr[6], pr[7]);
+		}
+		cache_out(mx + MX_TOAP_RING, MX_PACKETS * MX_PACKET_SIZE);
+		for (int i = 0; i < MX_PACKETS; i++) {
+			const uint8_t *sl = (const uint8_t *)(mx + MX_TOAP_RING + i * MX_PACKET_SIZE);
+			size_t n = strlen(slots);
+			snprintf(slots + n, sizeof(slots) - n, "[%02x %02x %02x %02x %02x %02x] ", sl[0], sl[1], sl[2], sl[3], sl[4], sl[5]);
+		}
+		cache_out(mx + 0x5000, 64);
+		cache_out(mx + 0x9000, 8);
+		/* the whole panic record (its second word: its length in bytes) and the log ring, kept for saying again */
+		wifi_dump[0] = 0;
+		if (panic_offset != 0 && panic_offset + 256 < WLBT_MEMORY) {
+			uint32_t *pr = (uint32_t *)(wlbt_memory + panic_offset);
+			cache_out(wlbt_memory + panic_offset, 256);
+			uint32_t words = pr[1] / 4;
+			dump_words("panic", pr, words > 0 && words <= 64 ? words : 16);
+		}
+		cache_out(mx + 0x5000, 0x4000);
+		uint32_t log_words = rd(mx + 0x9004);
+		dump_words("log", (const uint32_t *)(mx + 0x5000), log_words <= 256 ? log_words : 256);
+		printf("%s", wifi_dump);
+		printf("a51wifi: step 4 detail: panic record %s; to-AP slots %s; v4 filled by the firmware: compat %x SAP %x %x %x %x "
+		    "build %u patch %u; log stream indices %u/%u, its first words %x %x %x %x\n", panic, slots, rd(v4 + 8),
+		    *(volatile uint16_t *)(v4 + 12), *(volatile uint16_t *)(v4 + 14), *(volatile uint16_t *)(v4 + 16),
+		    *(volatile uint16_t *)(v4 + 18), rd(v4 + 20), rd(v4 + 24), rd(mx + 0x9000), rd(mx + 0x9004), rd(mx + 0x5000),
+		    rd(mx + 0x5004), rd(mx + 0x5008), rd(mx + 0x500c));
+		wifi_said("step 4: no answer to SM_MSG_START_REQ in 10 s (to-AP ring %u/%u, from-AP %u/%u, mailbox ISSR0 %x ISSR1 %x "
+		    "INTSR0 %x); init version %x; v4 SAP MLME %x build %u; panic record %s; log %u/%u", ridx, widx,
+		    rd(mx + MX_FROMAP_RIDX), rd(mx + MX_FROMAP_WIDX), rd(mbox + MBOX_ISSR(0)), rd(mbox + MBOX_ISSR(1)),
+		    rd(mbox + MBOX_INTSR0), taken, *(volatile uint16_t *)(v4 + 12), rd(v4 + 20), panic, rd(mx + 0x9000), rd(mx + 0x9004));
+		return false;
+	}
+	cache_out(mx + MX_TOAP_RING, MX_PACKETS * MX_PACKET_SIZE);
+	const uint8_t *answer = (const uint8_t *)(mx + MX_TOAP_RING + (ridx % MX_PACKETS) * MX_PACKET_SIZE);
+	w32(mx + MX_TOAP_RIDX, (ridx + 1) % MX_PACKETS);
+	cache_out(mx + MX_TOAP_RIDX, 4);
+	wr(mbox + 0x00c /* INTCR0 */, 0xffff0000);
+	bool cfm = answer[0] == 1 && answer[1] == 1 && answer[2] == 1;
+	vm_offset_t taken_config = taken == 5 ? v5 : v4;
+	wifi_said("step 4: %s (channel %u, service %u, message %u); the firmware took config version %u: SAP MLME %x, MA %x, "
+	    "debug %x, test %x, build %u, patch %u, headroom %u, tailroom %u; MIB %u bytes", cfm ? "SM_MSG_START_CFM, WLAN started" :
+	    "an answer", answer[0], answer[1], answer[2], taken, *(volatile uint16_t *)(taken_config + 12),
+	    *(volatile uint16_t *)(taken_config + 14), *(volatile uint16_t *)(taken_config + 16),
+	    *(volatile uint16_t *)(taken_config + 18), rd(taken_config + 20), rd(taken_config + 24),
+	    *(volatile uint8_t *)(taken_config + 28), *(volatile uint8_t *)(taken_config + 29), mib_size);
+	return cfm;
+}
+
 /* Step 2: the core started, its CFG_REQ answered. */
 static void
 wifi_step2(const uint8_t *fw, uint64_t size)
@@ -400,6 +670,7 @@ wifi_step2(const uint8_t *fw, uint64_t size)
 		}
 		IOSleep(10);
 	}
+	runtime_panic_offset = le32(fw + 176);
 	if (widx == ridx) {
 		uint32_t panic_offset = le32(fw + 176);
 		char words[200] = "";
@@ -426,6 +697,10 @@ wifi_step2(const uint8_t *fw, uint64_t size)
 	bool start_ind = packet[0] == 0 && packet[1] == 0;
 	wifi_said("step 3: %s from the firmware: %s; ring indices were %u/%u", start_ind ? "MM_START_IND" : "a message", got, ridx,
 	    widx);
+	if (start_ind && wifi_steps >= 4) {
+		IOSleep(100);
+		wifi_step4(mbox, mx_heap + MX_HEAP_SIZE);
+	}
 }
 
 /* Step 1's second half, once the small image is there: the firmware read and checked, the core's memory taken. */
@@ -483,6 +758,9 @@ wifi_thread(__unused void *parameter, __unused wait_result_t result)
 	for (int i = 0; i < 10; i++) {          /* said again, for the log that keeps only the end */
 		IOSleep(30000);
 		printf("a51wifi: %s\n", wifi_state);
+		if (wifi_dump[0]) {
+			printf("%s", wifi_dump);
+		}
 	}
 }
 
