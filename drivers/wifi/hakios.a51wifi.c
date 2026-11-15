@@ -51,6 +51,8 @@
  *              printed): MLME-CONNECT.req (SSID and our RSN element: CCMP, PSK, the AP's group cipher), MLME-CONNECT.ind,
  *              the 4-way handshake (hakios.a51wpa.c) over MA-UNITDATA.ind / MLME-SEND-FRAME.req, MLME-SETKEYS
  *              (pairwise, group) once message 4 is out, MLME-CONNECT-RES; then the data frames that come in, counted
+ *   8  the radio as Darwin's Wi-Fi: en0 (link down) at once; after step 5 the station side for wifid and Settings,
+ *              the queues looked at every 2 ms, data frames to and from en0; fw/wifi.conf joined as a standing join
  *
  * What the steps found is said again every 30 s for five minutes: a whole system's start pushes the first lines out of
  * the kernel log.
@@ -58,8 +60,9 @@
  * Status: steps 1 to 5 run on the phone (2026-11-15): the firmware starts (MM_START_IND) and so does the WLAN service
  * (SM_MSG_START_CFM, SAP MLME 14.7 / MA 14.1, as on Android); HIP4 signalling works both ways (MLME-ADD-VIF.req answered
  * by MLME-ADD-VIF.cfm, SUCCESS); step 6's passive scan lists networks (MLME-SCAN.ind, chained blocks); step 7 joins a
- * WPA2-Personal network (handshake, both keys set) and decrypted data frames come in. Not yet: an active scan, the
- * data path into Darwin's network stack (an interface, DHCP).
+ * WPA2-Personal network (handshake, both keys set) and decrypted data frames come in; step 8 (a51wifi=8) makes the radio
+ * Darwin's Wi-Fi: en0, wifid's station side, DHCP and traffic both ways (iOS online, the status bar's Wi-Fi icon).
+ * Not yet: an active scan, faster return of data blocks (frames dropped in bursts), power saving.
  */
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -71,6 +74,11 @@
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
+#include <kern/locks.h>
+#include <sys/errno.h>
+#include <sys/hakios.net.h>
+#include <sys/hakios.sta.h>
+#include <sys/kpi_mbuf.h>
 #include <sys/random.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -90,6 +98,7 @@ extern void IOSleep(unsigned int milliseconds);
 
 #define MBOX_PHYS               0x119c0000UL    /* dt scsc_wifibt reg, 0x180 bytes: the AP-WLBT mailbox */
 #define MBOX_INTMR0             0x010
+#define MBOX_INTCR0             0x00c
 #define MBOX_INTSR0             0x014
 #define MBOX_ISSR(r)            (0x080 + 4 * (r))
 
@@ -435,17 +444,21 @@ static uint32_t hip_base;                       /* step 4's region, as an offset
  */
 static uint8_t hip_headroom, hip_tailroom;
 
+/*
+ * A signal (and its payload) in the block at `offset` in the region, onto from-host queue `q`: the control pool's blocks
+ * go on FH_CTRL (pool 1, class 5), the data pool's on FH_DAT (pool 0, class 4), as hip4_skb_to_mbulk.
+ */
 static void
-hip_send(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_t length, const uint8_t *payload,
-    uint32_t payload_length)
+hip_put(vm_offset_t mbox, uint32_t offset, int q, uint8_t pool, uint8_t clas, const uint8_t *signal, uint32_t length,
+    const uint8_t *payload, uint32_t payload_length)
 {
-	vm_offset_t h = wlbt_memory + hip_base, m = h + HIP_TX_CTL + block * 2048;
+	vm_offset_t h = wlbt_memory + hip_base, m = h + offset;
 	uint32_t sig_bufsz = ((MBULK_DESC + length + 4 + 3) & ~3u) - MBULK_DESC;
 
 	bzero((void *)m, 2048);
 	w8(m + 4, 1 | 4);                               /* MBULK_F_SIG | MBULK_F_OBOUND (the firmware checks it: mif_q.c) */
-	w8(m + 5, MBULK_CLASS_FROM_HOST_CTL);
-	w8(m + 6, MBULK_POOL_CTRL);
+	w8(m + 5, clas);
+	w8(m + 6, pool);
 	w16(m + 10, (uint16_t)sig_bufsz);
 	memcpy((void *)(m + MBULK_DESC + 4), signal, length);
 	if (payload_length != 0) {
@@ -460,12 +473,20 @@ hip_send(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_t lengt
 	cache_out(m, 2048);
 
 	cache_out(h + HIP_SCOREBOARD, 128);
-	uint8_t w = *(volatile uint8_t *)(h + HIP_SCOREBOARD + 0);
-	w32(h + HIP_QUEUE(Q_FH_CTRL) + 4 * w, hip_base + HIP_TX_CTL + block * 2048);
-	cache_out(h + HIP_QUEUE(Q_FH_CTRL) + 4 * w, 4);
-	w8(h + HIP_SCOREBOARD + 0, (uint8_t)(w + 1));
-	cache_out(h + HIP_SCOREBOARD, 4);
+	uint8_t w = *(volatile uint8_t *)(h + HIP_SCOREBOARD + q);
+	w32(h + HIP_QUEUE(q) + 4 * w, hip_base + offset);
+	cache_out(h + HIP_QUEUE(q) + 4 * w, 4);
+	w8(h + HIP_SCOREBOARD + q, (uint8_t)(w + 1));
+	cache_out(h + HIP_SCOREBOARD, 8);
 	wr(mbox + MBOX_INTGR1, 1u << HIP_FROMHOST_BIT);
+}
+
+static void
+hip_send(vm_offset_t mbox, uint32_t block, const uint8_t *signal, uint32_t length, const uint8_t *payload,
+    uint32_t payload_length)
+{
+	hip_put(mbox, HIP_TX_CTL + block * 2048, Q_FH_CTRL, MBULK_POOL_CTRL, MBULK_CLASS_FROM_HOST_CTL, signal, length,
+	    payload, payload_length);
 }
 
 static void
@@ -581,7 +602,20 @@ static struct {
 	uint8_t secured;
 	uint8_t rsn[48];                /* the AP's RSN element, whole (id, length, body) */
 	uint8_t rsn_length;
+	uint16_t interval, capability;
+	uint64_t heard_ms;
+	uint16_t elements_length;
+	uint8_t elements[HAKIOS_STA_ELEMENTS_MOST];     /* the beacon's elements as received (for Darwin's Wi-Fi side) */
 } scan_seen[SCAN_MAX];
+
+static uint64_t
+now_ms(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000000;
+}
 static uint32_t scan_count, scan_frames, scan_other;
 static int scan_cfm = -1, scan_done;
 static char scan_ids[120];
@@ -644,6 +678,12 @@ scan_take(const uint8_t *sig, uint32_t sig_length, const uint8_t *data, uint32_t
 	scan_seen[i].mhz = (uint16_t)((sig[12] | sig[13] << 8) / 2);
 	scan_seen[i].rssi = (int16_t)(sig[14] | sig[15] << 8);
 	scan_seen[i].secured = (data[34] & 0x10) != 0;          /* capability: privacy */
+	scan_seen[i].interval = (uint16_t)(data[32] | data[33] << 8);
+	scan_seen[i].capability = (uint16_t)(data[34] | data[35] << 8);
+	scan_seen[i].heard_ms = now_ms();
+	scan_seen[i].elements_length = (uint16_t)(data_length - 36 < HAKIOS_STA_ELEMENTS_MOST ? data_length - 36 :
+	    HAKIOS_STA_ELEMENTS_MOST);
+	memcpy(scan_seen[i].elements, data + 36, scan_seen[i].elements_length);
 	for (uint32_t e = 36; e + 2 <= data_length && e + 2 + data[e + 1] <= data_length; e += 2 + data[e + 1]) {
 		if (data[e] == 0x30 && 2u + data[e + 1] <= sizeof(scan_seen[i].rsn)) {
 			scan_seen[i].rsn_length = (uint8_t)(2 + data[e + 1]);
@@ -782,9 +822,14 @@ void a51wpa_forget(void);
 
 static const uint8_t station_address[6] = { 0x02, 0xa5, 0x1c, 0x00, 0x00, 0x01 };     /* locally administered */
 
+static bool svc_on;                     /* a51wifi=8: the radio is Darwin's Wi-Fi (en0) */
+static void svc_input(const uint8_t *frame, uint32_t length, uint16_t descriptor);
+static bool svc_send(bool data, const uint8_t *sig, uint32_t length, const uint8_t *payload, uint32_t payload_length);
+
 static struct {
 	uint8_t bssid[6];
 	uint32_t next_block;            /* control blocks 2..31 in turn */
+	bool open;                      /* no RSN: no handshake, no keys */
 	uint16_t host_tag;
 	uint16_t m4_tag;
 	int connect_cfm, connect_ind, keys_cfm, keys_wanted;
@@ -812,6 +857,10 @@ hdr(uint8_t *sig, uint16_t id)
 static void
 link_send(const uint8_t *sig, uint32_t length, const uint8_t *data, uint32_t data_length)
 {
+	if (svc_on) {
+		(void)svc_send(false, sig, length, data, data_length);
+		return;
+	}
 	hip_send(link.mbox, link.next_block, sig, length, data, data_length);
 	link.next_block = link.next_block >= 31 ? 2 : link.next_block + 1;
 }
@@ -945,6 +994,9 @@ step7_take(const uint8_t *sig, uint32_t sig_length, const uint8_t *data, uint32_
 			return;
 		}
 		if (link.connected) {
+			if (svc_on) {
+				svc_input(f, n, id == MA_UNITDATA_IND && sig_length >= 14 ? a : 1);
+			}
 			link.data_frames++;
 			link.data_bytes += n;
 			snprintf(link.last_data, sizeof(link.last_data), "%02x:%02x:%02x:%02x:%02x:%02x type %02x%02x, %u bytes",
@@ -955,6 +1007,51 @@ step7_take(const uint8_t *sig, uint32_t sig_length, const uint8_t *data, uint32_
 	default:
 		link_note(id);
 		return;
+	}
+}
+
+/*
+ * After each look at the queues: message 4 out (or 1 s gone) -> the keys (as wpa_supplicant), both confirmed ->
+ * MLME-CONNECT-RES (rx.c, on M4's transmission status); an open network: MLME-CONNECT-RES once associated.
+ */
+static uint64_t link_m4_at;
+
+static void
+link_progress(void)
+{
+	if (link.connected) {
+		return;
+	}
+	if (link.open) {
+		if (link.connect_ind == 0) {
+			uint8_t res[24];
+			bzero(res, sizeof(res));
+			hdr(res, MLME_CONNECT_RES);
+			link_send(res, sizeof(res), NULL, 0);
+			link.connected = true;
+		}
+		return;
+	}
+	if (link.wpa_result == 4 && link_m4_at == 0) {
+		link_m4_at = now_ms();
+	}
+	if (!link.keys_set && link_m4_at != 0 && (link.m4_out || now_ms() - link_m4_at > 1000)) {
+		uint8_t tk[16], gtk[32], rsc[8];
+		int gtk_id;
+		size_t gtk_length = a51wpa_keys(tk, gtk, &gtk_id, rsc);
+		/* both against the AP's address: "Sta Group Key will use the peer address" (cfg80211_ops.c slsi_add_key) */
+		send_key(0, 1, link.bssid, NULL, link.cipher_group, tk, 16);
+		send_key((uint16_t)gtk_id, 0, link.bssid, rsc, link.cipher_group, gtk, (uint32_t)gtk_length);
+		bzero(tk, sizeof(tk));
+		bzero(gtk, sizeof(gtk));
+		link.keys_set = true;
+	}
+	if (link.keys_set && link.keys_cfm >= link.keys_wanted) {
+		uint8_t res[24];
+		bzero(res, sizeof(res));
+		hdr(res, MLME_CONNECT_RES);
+		link_send(res, sizeof(res), NULL, 0);
+		link.connected = true;
 	}
 }
 
@@ -1151,6 +1248,750 @@ wifi_step7(vm_offset_t mbox)
 		    "disconnected %u (reason %u); other signals: %s", link.connect_cfm, link.connect_ind, link.eapol,
 		    link.wpa_result, link.wpa_result < 0 ? ": " : "", link.wpa_result < 0 ? a51wpa_failure() : "",
 		    link.keys_cfm, link.keys_wanted, link.disconnected, link.disconnect_reason, link.ids[0] ? link.ids : "none");
+	}
+}
+
+/*
+ * a51wifi=8: the radio as Darwin's Wi-Fi. en0 (drivers/net/hakios.net.c) is made as soon as this driver's thread runs,
+ * its link down; once the firmware's interface is added (step 5) the station side (sys/hakios.sta.h) is attached, so
+ * Darwin's Wi-Fi side (hakios.apple80211.c: wifid, Settings) can scan and join, and the driver's thread becomes the
+ * one that looks at the firmware's queues, every 2 ms: scan reports, the join and its handshake, the data frames
+ * (to en0), the blocks the firmware hands back. fw/wifi.conf, if there is one, is joined at the start and again
+ * whenever the radio is turned on (a standing join).
+ */
+static LCK_GRP_DECLARE(a51wifi_lck_grp, "a51wifi");
+static LCK_MTX_DECLARE(svc_lock, &a51wifi_lck_grp);     /* the pools and the from-host queues: one sender at a time */
+
+#define HIP_TX_DAT              0x00a000        /* the data pool: 512 blocks of 2 KB */
+#define DAT_BLOCKS              512
+#define CTL_BLOCKS              32
+#define Q_FH_DAT                1
+#define Q_FH_RFB                2
+#define MBULK_POOL_DATA         0
+#define MBULK_CLASS_FROM_HOST_DAT 4
+#define MA_UNITDATA_REQ         0x1000
+#define MA_UNITDATA_CFM         0x1100
+#define MLME_DISCONNECT_REQ     0x200e
+#define MLME_DISCONNECT_CFM     0x210e
+
+static vm_offset_t svc_mbox;
+static char svc_events[700];            /* what the service did, said again with each minute's line */
+
+static void
+svc_event(const char *format, ...) __printflike(1, 2);
+
+static void
+svc_event(const char *format, ...)
+{
+	char line[160];
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	printf("a51wifi: %s\n", line);
+	size_t n = strlen(svc_events);
+	if (n + strlen(line) + 4 < sizeof(svc_events)) {
+		snprintf(svc_events + n, sizeof(svc_events) - n, "[%llus] %s; ", now_ms() / 1000, line);
+	}
+}
+static uint8_t ctl_used[CTL_BLOCKS], dat_used[DAT_BLOCKS];
+static uint32_t ctl_next, dat_next;
+static uint16_t svc_data_tag;
+static struct {
+	enum hakios_sta_phase phase;
+	int last_error;
+	struct hakios_sta_bss bss;      /* the network joined or being joined */
+	bool scanning;
+	uint64_t sent, sent_bytes, dropped_out, received, received_bytes, dropped_in, amsdu;
+	uint32_t no_block;
+} svc;
+
+/* A free block of a pool, taken; -1: none. Under svc_lock. */
+static int
+pool_take(uint8_t *used, uint32_t count, uint32_t *next)
+{
+	for (uint32_t k = 0; k < count; k++) {
+		uint32_t i = (*next + k) % count;
+		if (!used[i]) {
+			used[i] = 1;
+			*next = (i + 1) % count;
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+/* The blocks the firmware has handed back (FH_RFB: firmware writes byte 66, host reads byte 2), free again. */
+static void
+svc_reclaim(void)
+{
+	vm_offset_t h = wlbt_memory + hip_base;
+
+	lck_mtx_lock(&svc_lock);
+	cache_out(h + HIP_SCOREBOARD, 128);
+	uint8_t r = *(volatile uint8_t *)(h + HIP_SCOREBOARD + Q_FH_RFB);
+	uint8_t fw_w = *(volatile uint8_t *)(h + HIP_SCOREBOARD + 64 + Q_FH_RFB);
+	while (r != fw_w) {
+		cache_out(h + HIP_QUEUE(Q_FH_RFB) + 4 * r, 4);
+		uint32_t ref = rd(h + HIP_QUEUE(Q_FH_RFB) + 4 * r) - hip_base;
+		if (ref >= HIP_TX_DAT && ref < HIP_TX_DAT + DAT_BLOCKS * 2048) {
+			dat_used[(ref - HIP_TX_DAT) / 2048] = 0;
+		} else if (ref >= HIP_TX_CTL && ref < HIP_TX_CTL + CTL_BLOCKS * 2048) {
+			ctl_used[(ref - HIP_TX_CTL) / 2048] = 0;
+		}
+		r++;
+	}
+	w8(h + HIP_SCOREBOARD + Q_FH_RFB, r);
+	cache_out(h + HIP_SCOREBOARD, 8);
+	lck_mtx_unlock(&svc_lock);
+}
+
+/* A signal to the firmware in a block of its pool: control (MLME) or data (MA). false: no block free. */
+static bool
+svc_send(bool data, const uint8_t *sig, uint32_t length, const uint8_t *payload, uint32_t payload_length)
+{
+	lck_mtx_lock(&svc_lock);
+	int b = data ? pool_take(dat_used, DAT_BLOCKS, &dat_next) : pool_take(ctl_used, CTL_BLOCKS, &ctl_next);
+	if (b < 0) {
+		svc.no_block++;
+		lck_mtx_unlock(&svc_lock);
+		return false;
+	}
+	if (data) {
+		hip_put(svc_mbox, HIP_TX_DAT + (uint32_t)b * 2048, Q_FH_DAT, MBULK_POOL_DATA, MBULK_CLASS_FROM_HOST_DAT, sig, length,
+		    payload, payload_length);
+	} else {
+		hip_put(svc_mbox, HIP_TX_CTL + (uint32_t)b * 2048, Q_FH_CTRL, MBULK_POOL_CTRL, MBULK_CLASS_FROM_HOST_CTL, sig, length,
+		    payload, payload_length);
+	}
+	lck_mtx_unlock(&svc_lock);
+	return true;
+}
+
+/* en0's frame to send: MA-UNITDATA.req (tx.c): vif 1, a host tag, priority 0 (best effort), peer 1 (the AP), 802.3. */
+static bool
+svc_transmit(mbuf_t packet, size_t length)
+{
+	static uint8_t frame[HAKIOS_NET_FRAME_MAX];     /* (one sender at a time: hakios.net.c's tx lock) */
+	uint8_t sig[34];
+
+	if (svc.phase != HAKIOS_STA_JOINED || !link.connected || length < 14 || length > sizeof(frame) ||
+	    mbuf_copydata(packet, 0, length, frame) != 0) {
+		svc.dropped_out++;
+		return false;
+	}
+	bzero(sig, sizeof(sig));
+	sig[0] = MA_UNITDATA_REQ & 0xff;
+	sig[1] = MA_UNITDATA_REQ >> 8;
+	sig[4] = FAPI_SENDER & 0xff;
+	sig[5] = FAPI_SENDER >> 8;
+	sig[10] = 1;                                    /* vif */
+	svc_data_tag = (uint16_t)((svc_data_tag + 4) & 0x7ffc);
+	sig[12] = svc_data_tag & 0xff;
+	sig[13] = svc_data_tag >> 8;
+	sig[16] = 1;                                    /* peer index: the AP (queue set 0 + 1) */
+	sig[18] = 1;                                    /* FAPI_DATAUNITDESCRIPTOR_IEEE802_3_FRAME */
+	if (!svc_send(true, sig, sizeof(sig), frame, (uint32_t)length)) {
+		svc.dropped_out++;
+		return false;
+	}
+	svc.sent++;
+	svc.sent_bytes += length;
+	return true;
+}
+
+/* A frame that has come in, to en0: an 802.3 frame (descriptor 1), or an A-MSDU (3) taken apart into Ethernet frames. */
+static void
+svc_input(const uint8_t *f, uint32_t n, uint16_t descriptor)
+{
+	static uint8_t frame[HAKIOS_NET_FRAME_MAX];
+
+	if (descriptor == 1 || descriptor == 0) {
+		if (n >= 14 && n <= HAKIOS_NET_FRAME_MAX) {
+			hakios_net_input(f, n);
+			svc.received++;
+			svc.received_bytes += n;
+		} else {
+			svc.dropped_in++;
+		}
+		return;
+	}
+	if (descriptor != 3 && descriptor != 2) {
+		svc.dropped_in++;
+		return;
+	}
+	/* subframes: destination, source, length (big endian), LLC/SNAP and the payload, each padded to 4 bytes */
+	for (uint32_t at = 0; at + 14 <= n;) {
+		uint32_t length = (uint32_t)(f[at + 12] << 8 | f[at + 13]);
+		const uint8_t *p = f + at + 14;
+		if (at + 14 + length > n) {
+			break;
+		}
+		if (length >= 8 && p[0] == 0xaa && p[1] == 0xaa && p[2] == 0x03 && length - 8 + 14 <= sizeof(frame)) {
+			memcpy(frame, f + at, 12);
+			frame[12] = p[6];
+			frame[13] = p[7];
+			memcpy(frame + 14, p + 8, length - 8);
+			hakios_net_input(frame, length - 8 + 14);
+			svc.received++;
+			svc.received_bytes += length + 6;
+			svc.amsdu++;
+		} else {
+			svc.dropped_in++;
+		}
+		at = (at + 14 + length + 3) & ~3u;
+	}
+}
+
+/*
+ * The station's interface in the firmware, as Samsung's driver keeps it: added right before MLME-CONNECT.req
+ * (cfg80211_ops.c slsi_connect) and deleted when a join fails or the network is left or lost (slsi_handle_disconnect).
+ * Step 5 left one added.
+ */
+#define MLME_DEL_VIF_REQ        0x2008
+#define MLME_DEL_VIF_CFM        0x2108
+static bool svc_vif_up, svc_vif_lost;
+static volatile int svc_vif_cfm;                /* the last ADD-VIF/DEL-VIF.cfm's result; -1: none yet */
+
+static int
+svc_vif(bool add)
+{
+	uint8_t req[38];
+
+	bzero(req, sizeof(req));
+	hdr(req, add ? MLME_ADD_VIF_REQ : MLME_DEL_VIF_REQ);
+	if (add) {
+		memcpy(req + 12, station_address, 6);
+		req[18] = 2;                            /* FAPI_VIFTYPE_STATION */
+		memcpy(req + 20, station_address, 6);
+	}
+	svc_vif_cfm = -1;
+	if (!svc_send(false, req, add ? 38 : 24, NULL, 0)) {
+		return ENOBUFS;
+	}
+	for (int ms = 0; ms < 2000 && svc_vif_cfm < 0; ms += 10) {
+		IOSleep(10);
+	}
+	svc_vif_up = add && svc_vif_cfm == 0;
+	if (svc_vif_cfm != 0) {
+		svc_event("MLME-%s-VIF.cfm: %d", add ? "ADD" : "DEL", svc_vif_cfm);
+	}
+	return svc_vif_cfm == 0 ? 0 : EIO;
+}
+
+/* ---- the station side: called on hakios.sta.c's thread, one at a time ---- */
+
+static const uint16_t svc_channels_2g[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
+static const uint16_t svc_channels_5g[] = { 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132,
+	                                    136, 140, 149, 153, 157, 161, 165 };
+
+static uint16_t
+channel_mhz(uint16_t channel)
+{
+	return channel <= 14 ? (uint16_t)(2407 + 5 * channel) : (uint16_t)(5000 + 5 * channel);
+}
+
+static bool
+channel_radar(uint16_t channel)
+{
+	return channel >= 52 && channel <= 140;
+}
+
+static unsigned
+svc_op_channels(struct hakios_sta_channel *channels, unsigned most)
+{
+	unsigned n = 0;
+
+	for (size_t i = 0; i < sizeof(svc_channels_2g) / 2 && n < most; i++, n++) {
+		channels[n].frequency = channel_mhz(svc_channels_2g[i]);
+		channels[n].flags = 0;
+	}
+	for (size_t i = 0; i < sizeof(svc_channels_5g) / 2 && n < most; i++, n++) {
+		channels[n].frequency = channel_mhz(svc_channels_5g[i]);
+		channels[n].flags = channel_radar(svc_channels_5g[i]) ? HAKIOS_STA_CHANNEL_PASSIVE | HAKIOS_STA_CHANNEL_RADAR : 0;
+	}
+	return n;
+}
+
+/* MLME-ADD-SCAN.req as step 6, over the channels asked for (all: none asked); with an SSID, an active scan for it. */
+static int
+svc_op_scan(const struct hakios_sta_scan *what)
+{
+	uint8_t req[36], data[260];
+	uint32_t n = 0;
+	/* always passive for now: an active scan wants the probe request's elements (rates, capabilities) that wpa_supplicant
+	 * hands Samsung's driver, and the first one tried, without them, was followed by a silent firmware */
+	bool active = false;
+
+	bzero(req, sizeof(req));
+	req[0] = MLME_ADD_SCAN_REQ & 0xff;
+	req[1] = MLME_ADD_SCAN_REQ >> 8;
+	req[4] = FAPI_SENDER & 0xff;
+	req[5] = FAPI_SENDER >> 8;
+	req[13] = 1;                                    /* scan id 0x100 */
+	req[14] = 2;                                    /* full scan */
+	memcpy(req + 16, station_address, 6);
+	req[22] = 0x04;                                 /* real-time reports */
+	if (active) {
+		data[n++] = 0;
+		data[n++] = (uint8_t)(what->ssid_length > 32 ? 32 : what->ssid_length);
+		memcpy(data + n, what->ssid, data[n - 1]);
+		n += data[n - 1];
+	}
+	static const uint8_t timing[] = { 0xdd, 0x11, 0x00, 0x16, 0x32, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+	memcpy(data + n, timing, sizeof(timing));
+	n += sizeof(timing);
+	uint32_t list = n;
+	static const uint8_t list_header[] = { 0xdd, 0x05, 0x00, 0x16, 0x32, 0x01, 0x02 };
+	memcpy(data + n, list_header, sizeof(list_header));
+	n += sizeof(list_header);
+	for (int band = 0; band < 2; band++) {
+		const uint16_t *c = band ? svc_channels_5g : svc_channels_2g;
+		size_t count = band ? sizeof(svc_channels_5g) / 2 : sizeof(svc_channels_2g) / 2;
+		for (size_t i = 0; i < count; i++) {
+			uint16_t mhz = channel_mhz(c[i]);
+			bool wanted = what == NULL || what->frequency_count == 0;
+			for (unsigned k = 0; what != NULL && k < what->frequency_count && k < 64; k++) {
+				wanted |= what->frequencies[k] == mhz;
+			}
+			if (!wanted || n + 3 > sizeof(data)) {
+				continue;
+			}
+			data[n++] = (uint8_t)((2 * mhz) & 0xff);
+			data[n++] = (uint8_t)((2 * mhz) >> 8);
+			data[n++] = active && !channel_radar(c[i]) ? 0x00 : 0x01;      /* FAPI_SCANPOLICY_PASSIVE */
+		}
+	}
+	data[list + 1] = (uint8_t)(n - list - 2);
+	if (n - list == sizeof(list_header)) {
+		return EINVAL;                          /* none of the channels asked for */
+	}
+
+	scan_count = scan_frames = scan_other = 0;
+	scan_cfm = -1;
+	scan_done = 0;
+	svc.scanning = true;
+	enum hakios_sta_phase was = svc.phase;
+	if (was == HAKIOS_STA_IDLE) {
+		svc.phase = HAKIOS_STA_SCANNING;
+	}
+	if (!svc_send(false, req, sizeof(req), data, n)) {
+		svc.scanning = false;
+		svc.phase = was;
+		return ENOBUFS;
+	}
+	for (int ms = 0; ms < 20000 && !scan_done; ms += 20) {
+		if (scan_cfm > 0) {
+			break;
+		}
+		IOSleep(20);
+	}
+	svc.scanning = false;
+	if (svc.phase == HAKIOS_STA_SCANNING) {
+		svc.phase = was;
+	}
+	svc_event("scan: %s, %u reports, %u networks", scan_cfm > 0 ? "refused" : scan_done ? "done" : "not done in 20 s",
+	    scan_frames, scan_count);
+	return scan_cfm > 0 ? EIO : 0;
+}
+
+static void
+fill_bss(struct hakios_sta_bss *bss, uint32_t i)
+{
+	bzero(bss, sizeof(*bss));
+	memcpy(bss->bssid, scan_seen[i].bssid, 6);
+	bss->ssid_length = (uint8_t)strlen(scan_seen[i].ssid);
+	memcpy(bss->ssid, scan_seen[i].ssid, bss->ssid_length);
+	bss->frequency = scan_seen[i].mhz;
+	bss->rssi = scan_seen[i].rssi;
+	bss->beacon_interval = scan_seen[i].interval;
+	bss->capability = scan_seen[i].capability;
+	bss->age_ms = (uint32_t)(now_ms() - scan_seen[i].heard_ms);
+	bss->elements_length = scan_seen[i].elements_length;
+	memcpy(bss->elements, scan_seen[i].elements, bss->elements_length);
+}
+
+static void
+svc_op_heard(void (*each)(const struct hakios_sta_bss *bss, void *context), void *context)
+{
+	static struct hakios_sta_bss bss;
+
+	for (uint32_t i = 0; i < scan_count; i++) {
+		fill_bss(&bss, i);
+		each(&bss, context);
+	}
+}
+
+static void
+svc_disconnect(void)
+{
+	uint8_t req[32];
+
+	bzero(req, sizeof(req));
+	hdr(req, MLME_DISCONNECT_REQ);
+	memcpy(req + 12, link.bssid, 6);
+	req[18] = 3;                                    /* reason: the station is leaving */
+	(void)svc_send(false, req, sizeof(req), NULL, 0);
+	IOSleep(300);
+}
+
+static int
+svc_op_leave(void)
+{
+	if (svc.phase == HAKIOS_STA_JOINED || svc.phase == HAKIOS_STA_JOINING) {
+		svc.phase = HAKIOS_STA_IDLE;
+		hakios_net_link_state(false);
+		svc_disconnect();
+	}
+	link.connected = false;
+	a51wpa_forget();
+	if (svc_vif_up) {
+		(void)svc_vif(false);
+	}
+	return 0;
+}
+
+static int svc_join_one(const struct hakios_sta_join *what, uint8_t *tried);
+
+static int
+svc_op_join(const struct hakios_sta_join *what)
+{
+	if (svc.phase == HAKIOS_STA_JOINED || svc.phase == HAKIOS_STA_JOINING) {
+		(void)svc_op_leave();
+	}
+	/* the access point: of that name (and that BSSID, if one is given), heard best (5 GHz counted 15 dB better: step 7
+	 * joined there, and the 2.4 GHz side answered NOT_ALLOWED); a scan first if none was heard; the next on a refusal */
+	int error = ENOENT;
+	static uint8_t tried[SCAN_MAX];
+	bzero(tried, sizeof(tried));
+	for (int attempt = 0; attempt < 3; attempt++) {
+		error = svc_join_one(what, tried);
+		if (error != ECONNREFUSED) {
+			break;
+		}
+	}
+	return error;
+}
+
+static int
+svc_join_one(const struct hakios_sta_join *what, uint8_t *tried)
+{
+	static const uint8_t zero[6];
+	uint8_t pmk[32], snonce[32];
+	int best = -1;
+	for (int pass = 0; pass < 2 && best < 0; pass++) {
+		if (pass == 1) {
+			struct hakios_sta_scan scan;
+			bzero(&scan, sizeof(scan));
+			memcpy(scan.ssid, what->ssid, what->ssid_length);
+			scan.ssid_length = what->ssid_length;
+			(void)svc_op_scan(&scan);
+		}
+		for (uint32_t i = 0; i < scan_count; i++) {
+			int score = scan_seen[i].rssi + (scan_seen[i].mhz > 5000 ? 15 : 0);
+			int best_score = best < 0 ? 0 : scan_seen[best].rssi + (scan_seen[best].mhz > 5000 ? 15 : 0);
+			if (!tried[i] && strlen(scan_seen[i].ssid) == what->ssid_length &&
+			    memcmp(scan_seen[i].ssid, what->ssid, what->ssid_length) == 0 &&
+			    (memcmp(what->bssid, zero, 6) == 0 || memcmp(what->bssid, scan_seen[i].bssid, 6) == 0) &&
+			    (best < 0 || score > best_score)) {
+				best = (int)i;
+			}
+		}
+	}
+	if (best < 0) {
+		svc_event("join: the network is not in the scan (%u heard, or every one tried)", scan_count);
+		svc.last_error = ENOENT;
+		return ENOENT;
+	}
+	tried[best] = 1;
+
+	bzero(&link, sizeof(link));
+	link.mbox = svc_mbox;
+	link.connect_cfm = link.connect_ind = -1;
+	link_m4_at = 0;
+	memcpy(link.bssid, scan_seen[best].bssid, 6);
+	link.open = what->security == HAKIOS_STA_OPEN;
+	static const uint8_t rsn[22] = { 0x30, 0x14, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
+		                         0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, 0x00, 0x00 };
+	if (!link.open) {
+		const uint8_t *ap = scan_seen[best].rsn;
+		uint32_t ap_length = scan_seen[best].rsn_length, at = 8;
+		if (ap_length < 18) {
+			svc.last_error = ENOTSUP;
+			return ENOTSUP;
+		}
+		memcpy(link.cipher_group, ap + 4, 4);
+		bool ccmp = rsn_has(ap, ap_length, &at, 4), psk_akm = rsn_has(ap, ap_length, &at, 2);
+		uint16_t caps = at + 2 <= ap_length ? (uint16_t)(ap[at] | ap[at + 1] << 8) : 0;
+		if (!ccmp || !psk_akm || link.cipher_group[3] != 4 || (caps & 0x40)) {
+			printf("a51wifi: join: the network wants what is not handled (CCMP %d, PSK %d, group cipher %u, MFP required %d)\n",
+			    ccmp, psk_akm, link.cipher_group[3], (caps & 0x40) != 0);
+			svc.last_error = ENOTSUP;
+			return ENOTSUP;
+		}
+		if (what->passphrase_length > 0) {
+			a51wpa_pmk((const char *)what->passphrase, what->passphrase_length, what->ssid, what->ssid_length, pmk);
+		} else {
+			memcpy(pmk, what->pmk, 32);
+		}
+		read_random(snonce, sizeof(snonce));
+		a51wpa_begin(pmk, link.bssid, station_address, snonce, rsn, sizeof(rsn));
+		bzero(pmk, sizeof(pmk));
+	}
+	fill_bss(&svc.bss, (uint32_t)best);
+	svc.last_error = 0;
+	svc.phase = HAKIOS_STA_JOINING;
+	if (svc_vif_lost && svc_vif_up) {
+		(void)svc_vif(false);
+	}
+	svc_vif_lost = false;
+	if (!svc_vif_up && svc_vif(true) != 0) {
+		a51wpa_forget();
+		svc.phase = HAKIOS_STA_IDLE;
+		svc.last_error = EIO;
+		return EIO;
+	}
+
+	uint8_t sig[34], data[64];
+	uint32_t n = 0;
+	bzero(sig, sizeof(sig));
+	hdr(sig, MLME_CONNECT_REQ);
+	memcpy(sig + 12, link.bssid, 6);
+	sig[20] = (uint8_t)((scan_seen[best].mhz * 2) & 0xff);
+	sig[21] = (uint8_t)((scan_seen[best].mhz * 2) >> 8);
+	data[n++] = 0;
+	data[n++] = what->ssid_length;
+	memcpy(data + n, what->ssid, what->ssid_length);
+	n += what->ssid_length;
+	if (!link.open) {
+		memcpy(data + n, rsn, sizeof(rsn));
+		n += sizeof(rsn);
+	}
+	svc_event("join: MLME-CONNECT.req at %u MHz (%d dBm), %s", scan_seen[best].mhz, scan_seen[best].rssi,
+	    link.open ? "open" : "WPA2");
+	link_send(sig, sizeof(sig), data, n);
+
+	int error = ETIMEDOUT;
+	for (int ms = 0; ms < 20000; ms += 20) {
+		if (link.connected) {
+			error = 0;
+			break;
+		}
+		if (link.wpa_result < 0) {
+			error = EAUTH;                  /* message 3's MIC: the passphrase */
+			break;
+		}
+		if (link.connect_cfm > 0 || link.connect_ind > 0) {
+			error = ECONNREFUSED;
+			break;
+		}
+		if (link.disconnected) {
+			error = link.eapol ? EAUTH : ECONNREFUSED;     /* sent away during the handshake: most often the key */
+			break;
+		}
+		IOSleep(20);
+	}
+	if (error != 0) {
+		svc_event("join failed: %d (CONNECT.cfm %d, .ind %d, EAPOL %u, handshake %d%s%s, disconnected %u reason %u)",
+		    error, link.connect_cfm, link.connect_ind, link.eapol, link.wpa_result, link.wpa_result < 0 ? ": " : "",
+		    link.wpa_result < 0 ? a51wpa_failure() : "", link.disconnected, link.disconnect_reason);
+		if (link.connect_ind == 0 && !link.disconnected) {
+			svc_disconnect();
+		}
+		a51wpa_forget();
+		(void)svc_vif(false);
+		svc.phase = HAKIOS_STA_IDLE;
+		svc.last_error = error;
+		return error;
+	}
+	a51wpa_forget();
+	svc.phase = HAKIOS_STA_JOINED;
+	hakios_net_link_state(true);
+	svc_event("joined (%s); en0's link is up", link.open ? "open" : "WPA2, keys set");
+	return 0;
+}
+
+static int
+svc_op_power(bool on)
+{
+	if (!on) {
+		(void)svc_op_leave();
+		svc.phase = HAKIOS_STA_OFF;
+	} else if (svc.phase == HAKIOS_STA_OFF) {
+		svc.phase = HAKIOS_STA_IDLE;
+	}
+	return 0;
+}
+
+static void
+svc_op_state(struct hakios_sta_state *state)
+{
+	state->phase = svc.phase;
+	state->bss = svc.bss;
+	state->last_error = svc.last_error;
+}
+
+static struct hakios_sta_ops svc_ops = {
+	.power = svc_op_power,
+	.scan = svc_op_scan,
+	.heard = svc_op_heard,
+	.join = svc_op_join,
+	.leave = svc_op_leave,
+	.state = svc_op_state,
+	.channels = svc_op_channels,
+};
+
+static struct hakios_net_link svc_link = {
+	.name = "the Galaxy A51's radio (Samsung WLBT)",
+	.wireless = true,
+	.transmit = svc_transmit,
+};
+
+/* en0, its link down: as early as can be (Darwin's Wi-Fi side looks for the interface once, when it starts) */
+static void
+svc_attach_interface(void)
+{
+	memcpy(svc_link.address, station_address, 6);
+	if (!hakios_net_attach(&svc_link)) {
+		printf("a51wifi: EN0 HAS A LINK ALREADY: the radio is not Darwin's Wi-Fi\n");
+	}
+}
+
+static void
+svc_take(const uint8_t *sig, uint32_t sig_length, const uint8_t *data, uint32_t data_length)
+{
+	uint16_t id = sig_length >= 2 ? (uint16_t)(sig[0] | sig[1] << 8) : 0;
+
+	if (id == MLME_ADD_SCAN_CFM || id == MLME_SCAN_IND || id == MLME_SCAN_DONE_IND) {
+		scan_take(sig, sig_length, data, data_length);
+		return;
+	}
+	if (id == MA_UNITDATA_CFM || id == MLME_DISCONNECT_CFM || id == 0x2316 /* event log */) {
+		return;
+	}
+	if (id == MLME_ADD_VIF_CFM || id == MLME_DEL_VIF_CFM) {
+		svc_vif_cfm = sig_length >= 14 ? (sig[12] | sig[13] << 8) : 0;
+		return;
+	}
+	step7_take(sig, sig_length, data, data_length);
+}
+
+/* The driver's thread from here on. */
+static void
+svc_run(vm_offset_t mbox)
+{
+	char ssid[33], psk[64];
+	uint8_t pmk[32];
+	bool have_pmk;
+	uint64_t said = now_ms();
+
+	svc_mbox = mbox;
+	bzero(ctl_used, sizeof(ctl_used));
+	bzero(dat_used, sizeof(dat_used));
+	ctl_used[0] = ctl_used[1] = 1;                  /* step 5's block (it comes back on FH_RFB like the others) */
+	vm_offset_t h = wlbt_memory + hip_base;
+	cache_out(h, 512);
+	vm_offset_t config = rd(h + 4) == 5 ? h + HIP_V5 : h + HIP_V4;
+	hip_headroom = *(volatile uint8_t *)(config + 28);
+	hip_tailroom = *(volatile uint8_t *)(config + 29);
+	bzero(&link, sizeof(link));
+	link.mbox = mbox;
+	svc.phase = HAKIOS_STA_IDLE;
+	svc_vif_up = true;                              /* step 5's */
+	svc_on = true;
+	memcpy(svc_ops.address, station_address, 6);
+	hakios_sta_attach(&svc_ops);
+	wifi_said("service: the radio is Darwin's Wi-Fi (en0); headroom %u, tailroom %u", hip_headroom, hip_tailroom);
+
+	if (wifi_conf(ssid, sizeof(ssid), psk, sizeof(psk), pmk, &have_pmk)) {
+		struct hakios_sta_join *what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
+		if (what != NULL) {
+			what->ssid_length = (uint8_t)strlen(ssid);
+			memcpy(what->ssid, ssid, what->ssid_length);
+			what->security = HAKIOS_STA_WPA2_PSK;
+			if (have_pmk) {
+				memcpy(what->pmk, pmk, 32);
+			} else {
+				what->passphrase_length = (uint8_t)strlen(psk);
+				memcpy(what->passphrase, psk, what->passphrase_length);
+			}
+			int error = hakios_sta_ask_join_standing(what);
+			svc_event("the network of fw/wifi.conf asked for (a standing join): %d", error);
+			bzero(what, sizeof(*what));
+			kfree_data(what, sizeof(*what));
+		}
+	}
+	bzero(psk, sizeof(psk));
+	bzero(pmk, sizeof(pmk));
+
+	uint32_t panic_seen = 0;
+	uint64_t panic_checked = 0;
+	if (runtime_panic_offset != 0 && runtime_panic_offset + 16 < WLBT_MEMORY) {
+		cache_out(wlbt_memory + runtime_panic_offset, 16);
+		panic_seen = *(volatile uint32_t *)(wlbt_memory + runtime_panic_offset + 8);
+		svc_event("panic record at the start: %x", panic_seen);
+	}
+	for (;;) {
+		if (now_ms() - panic_checked >= 1000 && runtime_panic_offset != 0) {
+			panic_checked = now_ms();
+			cache_out(wlbt_memory + runtime_panic_offset, 16);
+			uint32_t p2 = *(volatile uint32_t *)(wlbt_memory + runtime_panic_offset + 8);
+			uint32_t p3 = *(volatile uint32_t *)(wlbt_memory + runtime_panic_offset + 12);
+			if (p2 != panic_seen) {
+				panic_seen = p2;
+				svc_event("FIRMWARE PANIC: log string %x, id %x (INTSR0 %x, INTMR0 %x)", p2, p3, rd(mbox + MBOX_INTSR0),
+				    rd(mbox + MBOX_INTMR0));
+			}
+		}
+		/* the to-host interrupt cleared first, as hip4's handler does (scsc_service_mifintrbit_bit_clear): the firmware
+		 * re-raises one the host leaves set every 2 s and panics after 10 (mif_th.c:1638, HOST_NOT_RESPONSIVE) */
+		wr(mbox + MBOX_INTCR0, 1u << (16 + HIP_TOHOST_BIT));     /* (unconditionally: the status reads masked) */
+		uint32_t got = hip_take(mbox, Q_TH_CTRL, svc_take) + hip_take(mbox, Q_TH_DAT, svc_take);
+		svc_reclaim();
+		link_progress();
+		if (svc.phase == HAKIOS_STA_JOINED && link.disconnected) {
+			svc_event("the network was lost (reason %u)", link.disconnect_reason);
+			svc.phase = HAKIOS_STA_IDLE;
+			svc.last_error = ECONNRESET;
+			link.connected = false;
+			hakios_net_link_state(false);
+			hakios_sta_lost(ECONNRESET);
+			svc_vif_lost = true;            /* deleted and added again before the next join */
+		}
+		if (now_ms() - said >= 60000) {
+			said = now_ms();
+			/* the firmware's state: its panic record (word 2: its log string's offset, 3: the panic id), the queues */
+			uint32_t pw[4] = { 0, 0, 0, 0 };
+			if (runtime_panic_offset != 0 && runtime_panic_offset + 16 < WLBT_MEMORY) {
+				cache_out(wlbt_memory + runtime_panic_offset, 16);
+				memcpy(pw, (const void *)(wlbt_memory + runtime_panic_offset), 16);
+			}
+			vm_offset_t sb = wlbt_memory + hip_base + HIP_SCOREBOARD;
+			cache_out(sb, 128);
+			uint32_t busy_ctl = 0, busy_dat = 0;
+			for (int i = 0; i < CTL_BLOCKS; i++) {
+				busy_ctl += ctl_used[i];
+			}
+			for (int i = 0; i < DAT_BLOCKS; i++) {
+				busy_dat += dat_used[i];
+			}
+			printf("a51wifi: service: panic record %x %x %x %x; queues host %02x %02x %02x %02x %02x %02x, firmware %02x %02x %02x "
+			    "%02x %02x %02x; blocks busy: control %u, data %u; events: %s\n", pw[0], pw[1], pw[2], pw[3],
+			    *(volatile uint8_t *)(sb + 0), *(volatile uint8_t *)(sb + 1), *(volatile uint8_t *)(sb + 2),
+			    *(volatile uint8_t *)(sb + 3), *(volatile uint8_t *)(sb + 4), *(volatile uint8_t *)(sb + 5),
+			    *(volatile uint8_t *)(sb + 64), *(volatile uint8_t *)(sb + 65), *(volatile uint8_t *)(sb + 66),
+			    *(volatile uint8_t *)(sb + 67), *(volatile uint8_t *)(sb + 68), *(volatile uint8_t *)(sb + 69), busy_ctl, busy_dat,
+			    svc_events[0] ? svc_events : "none");
+			printf("a51wifi: service: phase %d; sent %llu frames (%llu bytes, %llu dropped, %u without a block), received %llu "
+			    "(%llu bytes, %llu A-MSDU subframes, %llu dropped); other signals: %s\n", svc.phase, svc.sent, svc.sent_bytes,
+			    svc.dropped_out, svc.no_block, svc.received, svc.received_bytes, svc.amsdu, svc.dropped_in,
+			    link.ids[0] ? link.ids : "none");
+			link.ids[0] = 0;
+		}
+		if (got == 0) {
+			IOSleep(2);
+		}
 	}
 }
 
@@ -1583,6 +2424,9 @@ wifi_step2(const uint8_t *fw, uint64_t size)
 			IOSleep(100);
 			wifi_step5(mbox);
 			printf("a51wifi: (step 4 was: %s)\n", started);
+			if (wifi_steps >= 8 && vif_added) {
+				svc_run(mbox);                  /* (does not return) */
+			}
 			if (wifi_steps >= 6 && vif_added) {
 				char added[256];
 
@@ -1611,6 +2455,9 @@ wifi_thread(__unused void *parameter, __unused wait_result_t result)
 	uint64_t size = 0;
 	char build[96] = "";
 
+	if (wifi_steps >= 8) {
+		svc_attach_interface();
+	}
 	for (int t = 0; t < 240 && (fw = hakios_image_file("fw", FW_NAME, &size, NULL)) == NULL; t++) {
 		IOSleep(500);
 	}

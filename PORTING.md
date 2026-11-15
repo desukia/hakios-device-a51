@@ -626,3 +626,32 @@ Result on the phone (2026-11-15): connected to TP-Link_6960, SETKEYS.cfm 0 and 0
 20 s as MA-UNITDATA.ind, decrypted by the firmware (e.g. IPv4 from another station). Next: a network interface in
 Darwin (ifnet over MA-UNITDATA.req/ind), DHCP.
 
+### WiFi step 8: Darwin's Wi-Fi (WORKS: iOS online)
+
+`a51wifi=8`. The Darwin side already existed in HakiOS: drivers/net/hakios.net.c makes en0 over any "link"
+(sys/hakios.net.h), and hakios.sta.c / hakios.apple80211.c / hakios.wlan.cpp answer wifid over a "station boundary"
+(sys/hakios.sta.h). Those three were part of the Qualcomm WIFI driver; they are now their own driver, WIFI_STATION,
+required by both WIFI and A51WIFI (drivers/wifi/conf, stubs split in drivers/core/hakios.stubs.c, which also gives
+hakios_wifi_tell when WIFI is not built).
+
+hakios.a51wifi.c attaches en0 (link down) as soon as its thread runs; after step 5 it attaches the station side
+(power, scan, heard, join, leave, state, channels) and its thread becomes the dispatcher (every 2 ms): to-host queues,
+scan reports, joins (link_progress: keys after message 4, CONNECT-RES), data frames to en0 (802.3, and A-MSDU taken
+apart), FH_RFB (host blocks handed back: a free map for the 32 control and 512 data blocks). en0's frames go out as
+MA-UNITDATA.req 0x1000 (vif 1, host tag, priority 0, peer index 1, descriptor 1) in the data pool on FH_DAT (pool 0,
+class 4). fw/wifi.conf is a standing join (hakios_sta_ask_join_standing).
+
+Found on the way:
+- The firmware panics with COMMON_HOSTIO_HOST_NOT_RESPONSIVE (mif_th.c:1638) if the host never clears the to-host
+  interrupt: it re-raises it every 2 s and gives up after 10. The dispatcher writes INTCR0 bit 16+7 on every pass
+  (unconditionally: INTSR0 reads masked). Steps 5-7 were too short to see it.
+- The station VIF follows Samsung's life cycle: added before MLME-CONNECT.req, deleted after a failed join, a leave
+  or a loss (cfg80211_ops.c slsi_connect, slsi_handle_disconnect).
+- The router's 2.4 GHz side answered MLME-CONNECT.ind 0x30 (NOT_ALLOWED), twice; 5 GHz joins. Joins count 5 GHz 15 dB
+  better and try the next candidate on a refusal. Why 2.4 GHz is refused is not known yet.
+- Scans are passive: an active scan without the probe request's elements was followed by a silent firmware.
+
+Result on the phone (2026-11-15): joined at boot from wifi.conf (5240 MHz), DHCP, the status bar's Wi-Fi icon, in 3
+minutes 30338 frames (42.5 MB) received and 14060 (1.2 MB) sent; no firmware panic. 402 frames were dropped for want
+of a free data block (FH_RFB returns lag in bursts). wifid's later scans while joined hear only 2-3 networks.
+

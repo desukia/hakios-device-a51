@@ -3,6 +3,7 @@
 driver A51WIFI
 	file    bsd/dev/hakios.a51wifi.c
 	file    bsd/dev/hakios.a51wpa.c
+	requires WIFI_STATION
 	help    Samsung's WLBT core of the Exynos 9611 (scsc_wifibt@119c0000) woken step by step (a51wifi=N); its firmware
 	help    mx140.bin from the phone's Android in ../fw-wifi-a51; hakios.a51wpa.c: WPA2-Personal's handshake (a51wifi=7,
 	help    with ../fw-wifi-a51/wifi.conf: ssid=, psk= or pmk=)
