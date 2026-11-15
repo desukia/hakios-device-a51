@@ -1,0 +1,6 @@
+# devices/a51/drivers/wifi/conf: the Galaxy A51's Wi-Fi (docs/porting/drivers.md).
+
+driver A51WIFI
+	file    bsd/dev/hakios.a51wifi.c
+	help    Samsung's WLBT core of the Exynos 9611 (scsc_wifibt@119c0000) woken step by step (a51wifi=N); its firmware
+	help    mx140.bin from the phone's Android in ../fw-wifi-a51

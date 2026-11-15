@@ -438,3 +438,46 @@ scripted swipes): the A73s crossed 83 °C under load (hottest 88 °C). The watch
 once below 75 °C, back up one level every 5 s to 2314 MHz: 8 steps down, 8 up. The A53s (hottest 63 °C) and the GPU
 (64 °C) never needed it. Frames averaged 7.18 ms (7.75 at 1638/2080/572, 9.4 at the bootloader's speeds); 14074 GPU
 jobs, 0 failed, no panic. So the top levels are safe to ask for with the watch running.
+
+## WiFi: Samsung's integrated WLBT (S620 / "Maxwell"), research (2026-11-15)
+
+- Hardware: dt scsc_wifibt@119c0000 (0x180 bytes; interrupts MBOX SPI 42, ALIVE 28, WDOG 72, CFG_REQ 73), with syscons
+  baaw_p_wlbt 0x12050000, dbus_baaw 0x14c20000, pbus_baaw 0x14c30000, wlbt_remap 0x14c50000, boot_cfg 0x14c60000, and
+  the PMU (WLBT_CTRL_NS / WLBT_CTRL_S / CENTRAL_SEQ_WLBT_*). Shared memory: dt reserved-memory wifibt_if, 16 MB, placed
+  by Linux at boot (no fixed address), so HakiOS must find 16 MB of contiguous physical memory itself.
+- Firmware from the phone's Android (fw-wifi-a51/, not in git): /vendor/etc/wifi/mx140.bin (1835952 bytes, "smxf"
+  header, build S620_E9610_R3-1_Y23W37A), plus mx140_wlan.hcf / mx140_wlan_sw.hcf (config) and mx140_bt.hcf.
+- Samsung's driver (ref/scsc, from the Exynos9611Development tree): drivers/misc/samsung/scsc (mxman.c,
+  platform_mif_9610.c, mif_reg_S5E9610.h) and drivers/net/wireless/scsc (slsi: hip4.c, mlme.c, ...).
+- Start-up as mxman_start + platform_mif_9610 do it:
+  1. map the 16 MB; copy the firmware to its start; check the header and CRCs (fwhdr.c, fwimage.c)
+  2. lay out the memory managers (miframman), mailboxes and interrupt bits; build an mxconf block (magic, version,
+     the management transport's queues) in the shared memory
+  3. mailboxes: 0 = firmware entry point, 1 = mxconf (as the core sees it), 2 = 0xbcdeedcb, 3 = start flags
+  4. PMU: power on (WLBT_CTRL_NS MASK_PWR_REQ), release the reset, set WLBT_CTRL_S WLBT_START
+  5. the core raises CFG_REQ; the AP then makes WLBT's TZPC non-secure (SMC_CMD_CONN_IF), programs WLBT_REMAP and
+     the dbus/pbus BAAW windows (dbus window 0 → the 16 MB), sets boot_cfg (boot flag, keep-alive patch), writes
+     BOOT_CFG_ACK and hands MASK_PWR_REQ back to the firmware
+  6. wait for the firmware's MM_START_IND on the management transport; then services (WLAN) start over it
+- Driver started (2026-11-15): devices/a51/drivers/wifi/hakios.a51wifi.c, CONFIG_HAKIOS_A51WIFI=y, boot-arg a51wifi=N.
+  Step 1, read only: the PMU's WLBT registers and the AP-WLBT mailbox, then (in a thread, once the small image is
+  there) mx140.bin's header (smxf magic, versions, lengths, entry point, build) with its header and constant-part
+  CRC32s (ether_crc, as fwimage.c), and 16 MB of contiguous memory for the core (kmem_alloc_contig). The result
+  repeats every 30 s. userland/build.sh copies ../fw-wifi-a51 into fw/. Built, not yet run.
+- Step 1 on the phone (2026-11-15): mx140.bin is smxf, header v-, entry point 0x1a9 (Thumb, the core's R4), runtime
+  3520552 bytes; header CRC right. Its constant part is empty (length = header length, 420; CRC 0xffffffff), and the CRC
+  of everything after the header matches (0x6a1b47ee): the check now allows an empty constant part and checks that one
+  too. The 16 MB were taken at 0x88b104000 (above 4 GB; the bus window registers take the address >> 12). PMU
+  WLBT_CTRL_NS 0x3804a0, WLBT_CTRL_S 0, CENTRAL_SEQ_WLBT_STATUS 0: the core has not been started.
+- Step 2 written (built, not yet run): the firmware copied into the 16 MB (cache cleaned), mailboxes 0 = entry point and
+  2 = 0xbcdeedcb (1 and 3 left 0 until step 3 builds an mxconf), PMU power request / reset release / start, then the
+  CFG_REQ interrupt (SPI 73 → ID 105, level) answered as platform_cfg_req_isr does: TZPC SMC 0x82000710, WLBT_REMAP,
+  CHIP_VERSION_ID EMA bits, dbus window 0x80000000-0x81400000 → the 16 MB, the six pbus windows, boot_cfg flag, the
+  keep-alive patch (Samsung's ka_patch[], 58 words, extracted from the local Samsung source into
+  fw-wifi-a51/wlbt_ka_patch.bin, so it stays out of the repository) and BOOT_CFG_ACK; then 2 s of watching.
+- Step 2 on the phone (2026-11-15): THE CORE STARTS. CFG_REQ came within the second and was answered (TZPC SMC answered
+  0, success). Two seconds later mailbox 0 read 0x22220004 instead of the entry point written (0x1a9): the firmware ran
+  and wrote it, most likely a progress or error code for the missing configuration (mailbox 1 was 0). PMU
+  CENTRAL_SEQ_WLBT_STATUS reads 0. iOS ran normally. Next, step 3: an mxconf with the management transport (mxconf.h,
+  mxmgmt_transport, cpacket_buffer, mifintrbit) in mailbox 1, the firmware's panic record read
+  (fwhdr r4_panic_record_offset), and waiting for MM_START_IND.
