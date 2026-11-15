@@ -481,3 +481,22 @@ jobs, 0 failed, no panic. So the top levels are safe to ask for with the watch r
   CENTRAL_SEQ_WLBT_STATUS reads 0. iOS ran normally. Next, step 3: an mxconf with the management transport (mxconf.h,
   mxmgmt_transport, cpacket_buffer, mifintrbit) in mailbox 1, the firmware's panic record read
   (fwhdr r4_panic_record_offset), and waiting for MM_START_IND.
+- Step 3 written (built, not yet run): an mxconf (magic 0x79828486, v0.5, 240 bytes) and the management transport's
+  two rings (4 × 128-byte packets each, plus read/write indices) laid out just after the firmware's runtime part
+  (rounded up to 4 KB); mailbox 1 = the block's offset. Interrupt bits as Samsung's first-transport allocation: to-AP
+  stream write bit 0 / read bit 1, from-AP stream read bit 1 / write bit 2 (bit 0 of the from-host side is the R4's
+  panic bit). soc_revision from the chip id's low byte. After the CFG_REQ answer, the to-AP ring is watched up to 3 s
+  for MM_START_IND (channel 0, message 0, arg = WLBT hardware revision); failing that, the firmware's panic record.
+- Step 3, first run (2026-11-15): no MM_START_IND (to-AP ring indices stayed 0/0), but mailbox 0 went to 0x22220006,
+  against 0x22220004 with no mxconf: the firmware read the block and got two stages further. Its panic record (at
+  0x24398c) is all zeros: no crash, it waits. Added the transports Samsung also makes, with the bits its allocation gives
+  them (A51 defconfig: SCSC_MX450_GDB_SUPPORT off): gdb R4 (2 KB × 4-byte packets each way; to-AP write 2 / read 3,
+  from-AP read 3 / write 0 = panic bit), gdb M4 (to-AP write 4 / read 1 from the M4 set, from-AP read 5 / write 0),
+  mxlog (16 KB × 4 bytes, to-AP write 6 / read 4). Layout grows to 64 KB. Built, not yet run.
+- Step 3 with all transports (2026-11-15): **MM_START_IND received.** The firmware wrote one packet into the to-AP
+  management ring (indices 0 → 1): channel 0 (Maxwell management), message 0 (MM_START_IND), arg 0 (the WLBT hardware
+  revision Samsung's driver keeps as rf_hw_ver). So the WLBT core is fully started under HakiOS: firmware, mxconf, all
+  seven streams, the CFG_REQ handshake. The missing gdb and log transports were what held it at stage 0x22220006.
+  Next: the WLAN service. It's started over the service-management channel (srvman / servman_messages.h, channel 1),
+  then Samsung's slsi driver speaks HIP4 with the firmware over shared memory: MIBs (the .hcf config), MLME requests
+  (scan, connect) and data frames.

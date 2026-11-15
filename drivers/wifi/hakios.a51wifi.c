@@ -26,12 +26,18 @@
  *              the keep-alive patch (fw/wlbt_ka_patch.bin, Samsung's ka_patch[], at boot_cfg + 0x1000), boot_cfg 0 := 0,
  *              BOOT_CFG_ACK (boot_cfg 4 := 1), and MASK_PWR_REQ handed back; then watches two seconds
  *
+ *   3  with step 2: before the start, a configuration block (mxconf.h: magic 0x79828486, version 0.5) and the
+ *              management transport's two rings (mxmgmt_transport: 4 packets of 128 bytes each way, cpacket_buffer: the
+ *              packets, then a read and a write index) in the 16 MB just after the firmware's runtime part, mailbox 1
+ *              pointing at the block; after the CFG_REQ answer, the to-AP ring watched two seconds for the firmware's
+ *              MM_START_IND (channel 0, message 0, its argument the WLBT hardware revision). Without it, the firmware's
+ *              panic record (fwhdr r4_panic_record_offset) is read
+ *
  * What the steps found is said again every 30 s for five minutes: a whole system's start pushes the first lines out of
  * the kernel log.
  *
- * Status: steps 1 and 2 run on the phone (2026-11-15): firmware right, the 16 MB taken, the core started and its CFG_REQ
- * answered; with no mxconf yet it writes 0x22220004 to mailbox 0. Was, before step 2:
- * (PMU WLBT_CTRL_NS 0x3804a0, WLBT_CTRL_S 0, sequencer state 0).
+ * Status: steps 1 to 3 run on the phone (2026-11-15): the firmware starts and sends MM_START_IND (arg 0). Not yet:
+ * the WLAN service (service management, then the slsi driver's HIP4).
  */
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
@@ -170,6 +176,94 @@ ether_crc(const uint8_t *p, uint32_t length)
 	return crc;
 }
 
+/*
+ * Step 3's layout, as offsets in the 16 MB (which is how the core is told addresses: a "mifram ref", the distance from
+ * its start), just after the firmware's runtime part. mxconf (mxconf.h, natural alignment, 240 bytes): magic 0, version
+ * 4 (minor, major as two halves), the management transport at 8 (to-AP stream, then from-AP), the gdb R4 / M4 transports
+ * at 56 / 104, the log stream at 152, soc_revision 176, flags 180, fwconfig 184, gdb M4_1 192. A stream (24 bytes):
+ * buffer, number of packets, packet size, read-index location, write-index location, then the read and write
+ * interrupt bits. The bits as Samsung's allocation gives them for the first transport: the to-AP stream is written
+ * by the firmware with to-host bit 0 and read by us with from-host bit 1 (0 is the R4's panic bit); the from-AP one
+ * written by us with from-host bit 2, read by the firmware with to-host bit 1.
+ */
+#define MX_CONF                 0x000
+#define MX_TOAP_RING            0x400
+#define MX_TOAP_RIDX            0x600
+#define MX_TOAP_WIDX            0x604
+#define MX_FROMAP_RING          0x800
+#define MX_FROMAP_RIDX          0xa00
+#define MX_FROMAP_WIDX          0xa04
+#define MX_PACKETS              4
+#define MX_PACKET_SIZE          128
+#define MX_HEAP_SIZE            0x10000         /* what the layout below takes */
+#define CHIPID_PHYS             0x10000000UL    /* PRO_ID: its low byte the revision */
+
+static uint32_t mx_heap;                        /* where the layout starts in the 16 MB */
+
+static void
+mx_stream_sized(vm_offset_t conf, uint32_t ring, uint32_t ridx, uint32_t widx, uint8_t read_bit, uint8_t write_bit,
+    uint32_t packets, uint32_t packet_size)
+{
+	*(volatile uint32_t *)(conf + 0) = mx_heap + ring;
+	*(volatile uint32_t *)(conf + 4) = packets;
+	*(volatile uint32_t *)(conf + 8) = packet_size;
+	*(volatile uint32_t *)(conf + 12) = mx_heap + ridx;
+	*(volatile uint32_t *)(conf + 16) = mx_heap + widx;
+	*(volatile uint8_t *)(conf + 20) = read_bit;
+	*(volatile uint8_t *)(conf + 21) = write_bit;
+}
+
+static void
+mx_stream(vm_offset_t conf, uint32_t ring, uint32_t ridx, uint32_t widx, uint8_t read_bit, uint8_t write_bit)
+{
+	mx_stream_sized(conf, ring, ridx, widx, read_bit, write_bit, MX_PACKETS, MX_PACKET_SIZE);
+}
+
+/* The block and the rings written (the memory is zero apart from the firmware); returns the mifram ref of the block. */
+static uint32_t
+mx_build(uint32_t runtime_length)
+{
+	vm_offset_t chipid = ml_io_map(CHIPID_PHYS, 0x1000);
+
+	mx_heap = (runtime_length + 0xfff) & ~0xfffu;
+	vm_offset_t base = wlbt_memory + mx_heap, conf = base + MX_CONF;
+
+	bzero((void *)base, MX_HEAP_SIZE);
+	*(volatile uint32_t *)(conf + 0) = 0x79828486;          /* MXCONF_MAGIC */
+	*(volatile uint16_t *)(conf + 4) = 0;                   /* version major */
+	*(volatile uint16_t *)(conf + 6) = 5;                   /* minor */
+	mx_stream(conf + 8, MX_TOAP_RING, MX_TOAP_RIDX, MX_TOAP_WIDX, 1, 0);
+	mx_stream(conf + 32, MX_FROMAP_RING, MX_FROMAP_RIDX, MX_FROMAP_WIDX, 1, 2);
+	/*
+	 * The other transports Samsung's transports_init makes, after the management one, with the interrupt bits its
+	 * allocation then gives them (the A51 is built without SCSC_MX450_GDB_SUPPORT: the M4's from-host bits are a set of
+	 * their own, bit 0 reserved there too; a gdb transport's from-AP stream uses the reserved panic bit): the R4's gdb
+	 * channel (2 KB of 4-byte packets each way: to-AP write bit 2 / read 3, from-AP read 3 / write 0), the M4's (to-AP
+	 * write 4 / read 1, from-AP read 5 / write 0), and the log stream (16 KB of 4-byte packets, to-AP: write 6 / read 4).
+	 */
+	mx_stream_sized(conf + 56, 0x1000, 0x1800, 0x1804, 3, 2, 512, 4);       /* gdb R4, to AP */
+	mx_stream_sized(conf + 80, 0x2000, 0x2800, 0x2804, 3, 0, 512, 4);       /* gdb R4, from AP */
+	mx_stream_sized(conf + 104, 0x3000, 0x3800, 0x3804, 1, 4, 512, 4);      /* gdb M4, to AP */
+	mx_stream_sized(conf + 128, 0x4000, 0x4800, 0x4804, 5, 0, 512, 4);      /* gdb M4, from AP */
+	mx_stream_sized(conf + 152, 0x5000, 0x9000, 0x9004, 4, 6, 4096, 4);     /* the log */
+	memset((void *)(base + 0x1000), 0xff, 0x800);           /* the to-AP (IN) streams start 0xff, as mif_stream_init */
+	memset((void *)(base + 0x3000), 0xff, 0x800);
+	memset((void *)(base + 0x5000), 0xff, 0x4000);
+	*(volatile uint32_t *)(conf + 176) = chipid ? (rd(chipid) & 0xff) : 0;
+	*(volatile uint32_t *)(conf + 180) = 0;                 /* flags: FM not on */
+	memset((void *)(base + MX_TOAP_RING), 0xff, MX_PACKETS * MX_PACKET_SIZE);   /* as mif_stream_init, an IN stream */
+	return mx_heap + MX_CONF;
+}
+
+static void
+cache_out(vm_offset_t start, vm_size_t size)
+{
+	for (vm_offset_t line = start & ~63ul; line < start + size; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+}
+
 /* Step 2: the core started, its CFG_REQ answered. */
 static void
 wifi_step2(const uint8_t *fw, uint64_t size)
@@ -196,9 +290,17 @@ wifi_step2(const uint8_t *fw, uint64_t size)
 	}
 	__asm__ volatile ("dsb sy");
 
-	/* the boot ROM reads: mailbox 0 where to jump, 1 the configuration (none yet), 2 the magic, 3 the flags */
+	/* the boot ROM reads: mailbox 0 where to jump, 1 the configuration (step 3; none before), 2 the magic, 3 the flags */
+	uint32_t conf_ref = 0;
+	if (wifi_steps >= 3) {
+		conf_ref = mx_build(le32(fw + 36));
+		cache_out(wlbt_memory + mx_heap, MX_HEAP_SIZE);
+		/* the to-host bits: masked and cleared as platform_mif_9610 starts (INTMR0/INTCR0 0xffff0000) */
+		wr(mbox + MBOX_INTMR0, 0xffff0000);
+		wr(mbox + 0x00c /* INTCR0 */, 0xffff0000);
+	}
 	wr(mbox + MBOX_ISSR(0), entry);
-	wr(mbox + MBOX_ISSR(1), 0);
+	wr(mbox + MBOX_ISSR(1), conf_ref);
 	wr(mbox + MBOX_ISSR(2), MBOX2_MAGIC);
 	wr(mbox + MBOX_ISSR(3), 0);
 	__asm__ volatile ("dsb sy");
@@ -282,6 +384,48 @@ wifi_step2(const uint8_t *fw, uint64_t size)
 	wifi_said("step 2: CFG_REQ came and was answered (TZPC SMC %lld); after 2 s: PMU STATUS %x, mailbox INTSR1 %x, ISSR0..3 "
 	    "%x %x %x %x", tzpc, st[2], rd(mbox + MBOX_INTSR1), rd(mbox + MBOX_ISSR(0)), rd(mbox + MBOX_ISSR(1)),
 	    rd(mbox + MBOX_ISSR(2)), rd(mbox + MBOX_ISSR(3)));
+	if (wifi_steps < 3) {
+		return;
+	}
+
+	/* step 3: the firmware's first message, in the to-AP ring (it may well have come during the two seconds) */
+	vm_offset_t base = wlbt_memory + mx_heap;
+	uint32_t widx = 0, ridx = 0;
+	for (int ms = 0; ms <= 3000; ms += 10) {
+		cache_out(base + MX_TOAP_RIDX, 8);
+		ridx = rd(base + MX_TOAP_RIDX);
+		widx = rd(base + MX_TOAP_WIDX);
+		if (widx != ridx) {
+			break;
+		}
+		IOSleep(10);
+	}
+	if (widx == ridx) {
+		uint32_t panic_offset = le32(fw + 176);
+		char words[200] = "";
+		if (panic_offset != 0 && panic_offset + 64 < WLBT_MEMORY) {
+			cache_out(wlbt_memory + panic_offset, 64);
+			uint32_t *p = (uint32_t *)(wlbt_memory + panic_offset);
+			snprintf(words, sizeof(words), "%x %x %x %x %x %x %x %x", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+		}
+		wifi_said("step 3: no message from the firmware (to-AP ring indices %u/%u, mailbox INTSR0 %x ISSR0 %x); its panic "
+		    "record at %x: %s", ridx, widx, rd(mbox + MBOX_INTSR0), rd(mbox + MBOX_ISSR(0)), panic_offset, words);
+		return;
+	}
+	char got[160] = "";
+	uint32_t at = ridx % MX_PACKETS;
+	cache_out(base + MX_TOAP_RING, MX_PACKETS * MX_PACKET_SIZE);
+	const uint8_t *packet = (const uint8_t *)(base + MX_TOAP_RING + at * MX_PACKET_SIZE);
+	uint32_t arg = (uint32_t)packet[2] | (uint32_t)packet[3] << 8 | (uint32_t)packet[4] << 16 | (uint32_t)packet[5] << 24;
+	snprintf(got, sizeof(got), "channel %u, message %u, arg %x (raw %02x %02x %02x %02x %02x %02x %02x %02x)", packet[0],
+	    packet[1], arg, packet[0], packet[1], packet[2], packet[3], packet[4], packet[5], packet[6], packet[7]);
+	/* taken: the read index moved on, the to-host bit cleared */
+	*(volatile uint32_t *)(base + MX_TOAP_RIDX) = (ridx + 1) % MX_PACKETS;
+	cache_out(base + MX_TOAP_RIDX, 4);
+	wr(mbox + 0x00c /* INTCR0 */, 0xffff0000);
+	bool start_ind = packet[0] == 0 && packet[1] == 0;
+	wifi_said("step 3: %s from the firmware: %s; ring indices were %u/%u", start_ind ? "MM_START_IND" : "a message", got, ridx,
+	    widx);
 }
 
 /* Step 1's second half, once the small image is there: the firmware read and checked, the core's memory taken. */
