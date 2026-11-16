@@ -448,6 +448,11 @@ static uint32_t mali_submitted, mali_completed, mali_failed;
 static uint32_t mali_running;                   /* the fence of the chain on the GPU; 0: none */
 static uint32_t mali_running_slot;
 static uint64_t mali_running_since;
+/* Where the GPU's time goes, said with each status line: chains on the GPU, and the gaps between one done and the next
+ * started while others waited (the interrupt, the worker waking, the start). */
+static uint64_t mali_busy_abs, mali_gap_abs, mali_done_at;
+static uint32_t mali_busy_jobs, mali_gap_jobs;
+static bool mali_done_waiting;
 static uint64_t mali_running_jc;
 static bool mali_reset_wanted;
 static uint32_t mali_irq_pending;               /* bits 0 GPU, 1 JOB, 2 MMU: lines that fired and wait for the worker */
@@ -758,6 +763,11 @@ mali_start_next(void)
 	mali_running_slot = slot;
 	mali_running_jc = jc;
 	mali_running_since = mach_absolute_time();
+	if (mali_done_waiting) {
+		mali_gap_abs += mali_running_since - mali_done_at;
+		mali_gap_jobs++;
+		mali_done_waiting = false;
+	}
 	mwr(JS_HEAD_NEXT_LO(slot), (uint32_t)jc);
 	mwr(JS_HEAD_NEXT_HI(slot), (uint32_t)(jc >> 32));
 	mwr(JS_AFFINITY_NEXT_LO(slot), (uint32_t)mali_shaders);
@@ -777,6 +787,10 @@ mali_retire(bool ok)
 	if (!ok) {
 		mali_failed++;
 	}
+	mali_done_at = mach_absolute_time();
+	mali_busy_abs += mali_done_at - mali_running_since;
+	mali_busy_jobs++;
+	mali_done_waiting = mali_queue_count != 0;
 	mali_completed = mali_running;
 	mali_running = 0;
 	thread_wakeup((event_t)&mali_completed);
@@ -1170,6 +1184,16 @@ mali_worker(__unused void *parameter, __unused wait_result_t result)
 			    HakiosMaliSelfTest());
 			if (mali_clock_state[0]) {
 				printf("a51gpu: clock: %s\n", mali_clock_state);
+			}
+			{
+				uint64_t busy_ns, gap_ns;
+				absolutetime_to_nanoseconds(mali_busy_abs, &busy_ns);
+				absolutetime_to_nanoseconds(mali_gap_abs, &gap_ns);
+				printf("a51gpu: lately: %u chains, %llu us each on the GPU on the average; %u gaps between one done and the next "
+				    "started while it waited, %llu us each\n", mali_busy_jobs, mali_busy_jobs ? busy_ns / mali_busy_jobs / 1000 : 0,
+				    mali_gap_jobs, mali_gap_jobs ? gap_ns / mali_gap_jobs / 1000 : 0);
+				mali_busy_abs = mali_gap_abs = 0;
+				mali_busy_jobs = mali_gap_jobs = 0;
 			}
 			cpu_clocks_say();
 			tmu_say();

@@ -448,6 +448,8 @@ public:
 	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
+	IOReturn dispatchMethod(uint32_t selector, IOExternalMethodArguments * args,
+	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference);
 	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
 	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
 };
@@ -886,6 +888,43 @@ HakiosMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
 
 IOReturn
 HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
+    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
+{
+	/*
+	 * How many requests of each kind, and how long each took here, said every 30 s: a frame of the window server's took
+	 * 30 ms of its thread, most of it in requests to this driver (glprof, 16 November).
+	 */
+	static uint64_t calls[128], spent[128], since;
+	uint64_t began = mach_absolute_time();
+	IOReturn ret = dispatchMethod(selector, args, dispatch, target, reference);
+	uint64_t now = mach_absolute_time(), period;
+
+	if (selector < 128) {
+		OSIncrementAtomic64((SInt64 *) &calls[selector]);
+		OSAddAtomic64((SInt64) (now - began), (SInt64 *) &spent[selector]);
+	}
+	nanoseconds_to_absolutetime(30 * NSEC_PER_SEC, &period);
+	if (since == 0) {
+		since = now;
+	} else if (now - since >= period && OSCompareAndSwap64(since, now, &since)) {
+		char line[600] = "";
+		size_t at = 0;
+		for (unsigned s = 0; s < 128 && at + 40 < sizeof(line); s++) {
+			uint64_t n = calls[s], ns;
+			if (n == 0) {
+				continue;
+			}
+			absolutetime_to_nanoseconds(spent[s], &ns);
+			at += (size_t) snprintf(line + at, sizeof(line) - at, " %#x: %llu (%llu us each)", s, n, ns / n / 1000);
+			calls[s] = spent[s] = 0;
+		}
+		printf("HakiosMali: requests in 30 s, by selector:%s\n", line);
+	}
+	return ret;
+}
+
+IOReturn
+HakiosMaliUserClient::dispatchMethod(uint32_t selector, IOExternalMethodArguments * args,
     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
 {
 	union {
