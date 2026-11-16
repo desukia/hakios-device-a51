@@ -682,3 +682,12 @@ Result: 9.5 ms a frame, 27-31 frames a second while swiping. What is left: the w
 (CoreAnimation/GPU), and tearing (the copy is not synchronised with DECON's TE-triggered transfers; command mode,
 psr_mode 2, trig_mode 0: HW_SW_TRIG_CONTROL 0x70, INTERRUPT_PENDING 0x4c FRAME_DONE bit 13, FRAME_COUNT 0x2a0).
 
+## Display: no tearing (2026-11-16)
+
+DECON (0x148b0000) in command mode with the hardware trigger on and unmasked (HW_SW_TRIG_CONTROL 0x1001) sends the
+framebuffer on every TE, 60 a second (FRAME_COUNT and HW_TE_CNT both +60 in a second); the boot loader left interrupts
+0x3011 enabled. FRAME_START and FRAME_DONE come together, near the end of a transfer. CONFIG_FB_DECON_TRIG=1: the
+trigger is masked while a frame is written and armed when it is whole; the next frame first waits for a transfer to be
+done. Seen on the phone: the tearing is gone. Still about 30 frames a second while swiping and laggy to the touch: most
+swaps come late from the window server itself (next to look at), not the display's 9.5 ms.
+
