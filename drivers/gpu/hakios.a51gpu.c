@@ -1583,6 +1583,28 @@ clock_thread(__unused void *parameter, __unused wait_result_t result)
 		cmd[3] = 0;
 		answered[d] = acpm_call(&dvfs, cmd);
 	}
+	/*
+	 * The memory interface (MIF, domain 0) and the internal bus (INT, domain 1), at their highest (dt devfreq_mif and
+	 * devfreq_int freq_info: max 2093 and 667 MHz; Android holds MIF there only for 40 s after boot, then from 676 MHz up
+	 * as the load asks, and nobody asked here). Tried as the cause of the display's slow frames (16 November) and it was
+	 * not: those were three processors writing the write-combined framebuffer at once (MiniIOMobileFramebuffer,
+	 * CONFIG_FB_THREADS=1). So asked only when given: a51mif_khz=2093000, a51int_khz=667000.
+	 */
+	uint32_t bus_khz[2] = { 0, 0 };
+	bool bus_answered[2] = { false, false };
+	PE_parse_boot_argn("a51mif_khz", &bus_khz[0], sizeof(bus_khz[0]));
+	PE_parse_boot_argn("a51int_khz", &bus_khz[1], sizeof(bus_khz[1]));
+	for (uint32_t d = 0; d < 2; d++) {
+		if (bus_khz[d] != 0) {
+			cmd[0] = d;                     /* dm_mif 0, dm_int 1 (dt acpm_dvfs: cal_id 0xb040000, 0xb040001) */
+			cmd[1] = bus_khz[d];
+			cmd[2] = ACPM_FREQ_REQ;
+			cmd[3] = 0;
+			bus_answered[d] = acpm_call(&dvfs, cmd);
+		}
+	}
+	clock_said("step 3: asked the memory interface %u kHz (%s), the internal bus %u kHz (%s)", bus_khz[0],
+	    bus_answered[0] ? "answered" : "no answer", bus_khz[1], bus_answered[1] ? "answered" : "no answer");
 	IOSleep(10);
 	uint32_t pll0 = cmu_cpucl0 ? rd(cmu_cpucl0 + 0x140) : 0, pll1 = cmu_cpucl1 ? rd(cmu_cpucl1 + 0x120) : 0;
 	if (!cmu_cpucl0) {

@@ -746,7 +746,19 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 	 * need nothing. As HakiosGPU's submit().
 	 */
 	uint64_t now_abs = mach_absolute_time(), again;
-	nanoseconds_to_absolutetime(MALI_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
+	/*
+	 * (Tests: boot-arg mali_flush=0, no IOSurface pushed out of the cache at all -- pictures may come out stale; mali_push_ms=N,
+	 * an unchanged surface pushed again after N ms instead of 4. The display's frames took 37 ms a third while these pushes
+	 * ran, 16 November: every surface a submission names, 11 MB each, line by line.)
+	 */
+	static uint32_t flush_surfaces = 1, push_ms = MALI_PUSH_AGAIN_MS;
+	static bool flush_args;
+	if (!flush_args) {
+		PE_parse_boot_argn("mali_flush", &flush_surfaces, sizeof(flush_surfaces));
+		PE_parse_boot_argn("mali_push_ms", &push_ms, sizeof(push_ms));
+		flush_args = true;
+	}
+	nanoseconds_to_absolutetime((uint64_t) push_ms * NSEC_PER_MSEC, &again);
 	for (uint32_t done = 0; done < count;) {
 		uint32_t now = count - done > 256 ? 256 : count - done;
 
@@ -759,7 +771,7 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 			if (b == NULL) {
 				continue;
 			}
-			if (b->surface != NULL) {
+			if (b->surface != NULL && flush_surfaces) {
 				uint32_t seed = b->surface->shared()->seed;
 
 				if (seed != b->seed || now_abs - b->pushed >= again) {

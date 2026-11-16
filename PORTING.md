@@ -661,3 +661,24 @@ index, losing frames and leaking their blocks. hip_put now refuses a full queue 
 transmit waits up to 10 ms (reclaiming) instead of dropping. Next run: 0 dropped of 10071 sent, 47 MB received, data
 blocks busy at most 321 and back to 0.
 
+Joining a network from Settings works too (2026-11-16): wifid asks the station side (hakios.apple80211.c) with the
+passphrase as typed.
+
+## Display: frames 38 ms -> 9.5 ms (2026-11-16)
+
+Frames came at 13-20 a second, every one "a refresh late": MiniIOMobileFramebuffer scales the window server's 1125x2436
+surface onto the 1080x2400 panel with the CPU, in the boot loader's framebuffer, and that took 38 ms. Found by
+measuring, step by step (boot-arg fb_bench=1 and the frame report's new line):
+- one layer a frame, the two surfaces of the window server (kernel memory, not a program's own);
+- the three shares took the same 37 ms on A53s and A73s alike, no row over 1 ms (not descheduled);
+- memory alone is fast: the surface read 1.3-4.4 GB/s, the framebuffer written 0.9-2.8 GB/s by one thread; drawRows
+  alone, one thread, the whole panel in 6 ms;
+- not the memory clock (MIF at 2093 MHz changed nothing; now opt-in, a51mif_khz=) and not the GPU driver's cache
+  maintenance (mali_flush=0, a test switch, changed nothing);
+- probes in the live frames: a source row read in 2.3 us, a panel row written in 44 us. Three processors writing the
+  write-combined framebuffer at once got ~100 MB/s between them; one writes a row in 3.4 us.
+configs/a51.config sets CONFIG_FB_THREADS=1 (a51-ios.sh now passes the .config's boot-arguments, as make run does).
+Result: 9.5 ms a frame, 27-31 frames a second while swiping. What is left: the window server's own swaps come late
+(CoreAnimation/GPU), and tearing (the copy is not synchronised with DECON's TE-triggered transfers; command mode,
+psr_mode 2, trig_mode 0: HW_SW_TRIG_CONTROL 0x70, INTERRUPT_PENDING 0x4c FRAME_DONE bit 13, FRAME_COUNT 0x2a0).
+
