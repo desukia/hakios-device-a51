@@ -691,3 +691,19 @@ trigger is masked while a frame is written and armed when it is whole; the next 
 done. Seen on the phone: the tearing is gone. Still about 30 frames a second while swiping and laggy to the touch: most
 swaps come late from the window server itself (next to look at), not the display's 9.5 ms.
 
+## Display: two framebuffers, 48-62 frames a second (2026-11-16)
+
+The one-buffer handshake with DECON (CONFIG_FB_DECON_TRIG) kept frames from tearing most of the time but made each frame
+wait out a whole transfer, which locked gestures at 30 frames a second, and 7-14% of frames still saw a transfer while
+written. Now two framebuffers (CONFIG_FB_DECON_DOUBLE, CONFIG_FB_DECON_SECOND=0xcaa00000):
+- DECON reads through DPP channel dpp2, IDMA at 0x14881000 (IDMA_IN_BASE_ADDR_Y 0x40 = 0xca000000), taken at a frame's
+  start after SHADOW_REG_UPDATE_REQ bit 31 (0x148b0060), which DECON clears when it has.
+- The loader hands XNU only the largest free block (bank 3, above 4 GB): XNU has no memory below 4 GB, and the register
+  is 32 bits. So the second buffer is reserved by UEFI: uefi/files/.../MemoryMapLib.c reserves 20 MB at 0xCA000000
+  ("Display Reserved"; the RAM after it from 0xCB400000). Recovery image out/hakios-a51-fb2-RECOVERY.tar.md5 (the
+  previous one, 10 MB reserved, is out/hakios-a51-kernel-RECOVERY.tar.md5: with it, fb_decon_second must not be set).
+- Mapped through IOKit (IOMemoryDescriptor::withPhysicalAddress, write-combined): ml_io_map_wcomb panicked
+  ("kmem_alloc ... failed with 3": the I/O map has no room for another 10 MB).
+Result: 1270 frames handed over, none late; gestures 48-62 frames a second, 44% of frame steps over 16.7 ms (100%
+before). What is left is the window server's own drawing, about 16 ms a frame (Mesa and CoreAnimation on the CPU).
+
