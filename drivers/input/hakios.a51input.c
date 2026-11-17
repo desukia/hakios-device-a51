@@ -287,12 +287,53 @@ scale(uint32_t v, uint32_t range)
 	return (uint32_t)((uint64_t)v * 65535 / (range - 1));
 }
 
+/*
+ * How often a finger that moves is reported (the screen's content follows it no more often): the time from one move
+ * of the first finger to its next, and how long the chip's two reads took. Said every 10 s that had moves.
+ */
+static uint32_t touch_gaps[7];                  /* under 10, 15, 20, 30, 50, 100 ms, longer */
+static uint32_t touch_moves, touch_reads;
+static uint64_t touch_last_move, touch_read_ns, touch_read_worst;
+
+static void
+touch_gap(void)
+{
+	uint64_t now = mach_absolute_time(), ns;
+	static const uint32_t limits[] = { 10, 15, 20, 30, 50, 100 };
+	unsigned b;
+
+	if (touch_last_move != 0) {
+		absolutetime_to_nanoseconds(now - touch_last_move, &ns);
+		for (b = 0; b < 6 && ns >= (uint64_t)limits[b] * NSEC_PER_MSEC; b++) {
+		}
+		touch_gaps[b]++;
+	}
+	touch_last_move = now;
+	touch_moves++;
+}
+
+static void
+touch_report(void)
+{
+	if (touch_moves == 0) {
+		return;
+	}
+	printf("a51input: touch, 10 s: %u moves of the first finger, from one to the next: under 10 ms %u, 10-15 %u, 15-20 %u, "
+	    "20-30 %u, 30-50 %u, 50-100 %u, longer %u; %u reads of the chip, %llu us each, the longest %llu us\n", touch_moves,
+	    touch_gaps[0], touch_gaps[1], touch_gaps[2], touch_gaps[3], touch_gaps[4], touch_gaps[5], touch_gaps[6], touch_reads,
+	    touch_reads != 0 ? touch_read_ns / touch_reads / 1000 : 0, touch_read_worst / 1000);
+	bzero(touch_gaps, sizeof(touch_gaps));
+	touch_moves = touch_reads = 0;
+	touch_read_ns = touch_read_worst = 0;
+}
+
 static void
 touch_events(void)
 {
 	uint8_t info = 0, buf[MIP_EVENT_SIZE * MIP_MAX_FINGERS];
 	unsigned size;
 	int r;
+	uint64_t began = mach_absolute_time(), ns;
 
 	if ((r = mip_read(0x02, 0x10, &info, 1)) != 0) {
 		if (touch_errors++ < 10) {
@@ -312,6 +353,10 @@ touch_events(void)
 		}
 		return;
 	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	touch_reads++;
+	touch_read_ns += ns;
+	touch_read_worst = ns > touch_read_worst ? ns : touch_read_worst;
 	if (info & 0x80) {
 		return;                         /* an alert (ESD, gestures...): nothing to post */
 	}
@@ -326,6 +371,11 @@ touch_events(void)
 		}
 		x = scale(x, res_x);
 		y = scale(y, res_y);
+		if (state == 2 && id == 0 && finger_down[id]) {
+			touch_gap();
+		} else if (state == 3 && id == 0) {
+			touch_last_move = 0;
+		}
 		if (state == 1 || state == 2) {
 			hakios_touch_post(finger_down[id] ? HAKIOS_TOUCH_MOVE : HAKIOS_TOUCH_DOWN, (uint32_t)id, x, y);
 			finger_down[id] = 1;
@@ -408,6 +458,9 @@ a51input_thread(__unused void *arg, __unused wait_result_t wr_)
 			buttons_look();
 		}
 		tick++;
+		if (touch_on && tick % (10000 / TOUCH_POLL_MS) == 0) {
+			touch_report();
+		}
 		sleep_ms(TOUCH_POLL_MS);
 	}
 }

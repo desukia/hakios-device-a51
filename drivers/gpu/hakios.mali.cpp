@@ -740,6 +740,37 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 	if (request->jc == 0 || count > 65536) {
 		return kIOReturnBadArgument;
 	}
+	/*
+	 * Not into a surface the display has yet to copy out, or is copying (MiniIOSurfaceWaitShown): CoreAnimation draws its
+	 * next frame into the one being shown otherwise, and the panel gets it half drawn. 50 ms at the most.
+	 */
+	{
+		MiniIOSurface * shown[8];
+		unsigned found = 0;
+
+		IOLockLock(gMaliLock);
+		for (uint32_t done = 0; done < count && found < 8;) {
+			uint32_t now = count - done > 256 ? 256 : count - done;
+
+			if (copyin((user_addr_t)(request->bo_handles + done * sizeof(uint32_t)), handles, now * sizeof(uint32_t)) != 0) {
+				break;
+			}
+			for (uint32_t i = 0; i < now && found < 8; i++) {
+				struct mali_buffer * b = buffer(handles[i]);
+
+				if (b != NULL && b->surface != NULL && b->surface->displaying != 0) {
+					b->surface->retain();
+					shown[found++] = b->surface;
+				}
+			}
+			done += now;
+		}
+		IOLockUnlock(gMaliLock);
+		for (unsigned i = 0; i < found; i++) {
+			MiniIOSurfaceWaitShown(shown[i], 50);
+			shown[i]->release();
+		}
+	}
 	IOLockLock(gMaliLock);
 	/*
 	 * The GPU reads and writes memory, not this processor's cache. What the cache holds of an IOSurface goes out of it
