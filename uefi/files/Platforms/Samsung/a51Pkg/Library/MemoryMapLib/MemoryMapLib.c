@@ -42,10 +42,11 @@ gMemoryDescriptor[] = {
   {"RAM Partition",      0xC0080000, 0x00F80000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK},
   {"XNU Payload",        0xC1000000, 0x04000000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_BACK},  // HakiOS: the boot shim copies the XNUP container here
   {"RAM Partition",      0xC5000000, 0x05000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK},
-  // two framebuffers of 1080x2400x4 = 0x9E3400 each: the boot loader's at 0xCA000000, and at 0xCAA00000 the second
-  // that HakiOS's display driver switches DECON to and from (fb_decon_double: frames never read while written)
-  {"Display Reserved",   0xCA000000, 0x01400000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH},
-  {"RAM Partition",      0xCB400000, 0x14C00000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK},
+  // three framebuffers of 1080x2400x4 = 0x9E3400 each: the boot loader's at 0xCA000000, and at 0xCAA00000 and
+  // 0xCB400000 two more that HakiOS's display driver switches DECON between (fb_decon_double, fb_decon_second,
+  // fb_decon_third: a frame is written into one DECON neither reads nor is about to, without waiting for it)
+  {"Display Reserved",   0xCA000000, 0x01E00000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH},
+  {"RAM Partition",      0xCBE00000, 0x14200000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK},
 
   //
   // DRAM bank 2: 0xE1900000 - 0x100000000
