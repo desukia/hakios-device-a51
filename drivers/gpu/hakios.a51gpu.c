@@ -1612,12 +1612,15 @@ clock_thread(__unused void *parameter, __unused wait_result_t result)
 	 * devfreq_int freq_info: max 2093 and 667 MHz; Android holds MIF there only for 40 s after boot, then from 676 MHz up
 	 * as the load asks, and nobody asked here). Tried as the cause of the display's slow frames (16 November) and it was
 	 * not: those were three processors writing the write-combined framebuffer at once (MiniIOMobileFramebuffer,
-	 * CONFIG_FB_THREADS=1). So asked only when given: a51mif_khz=2093000, a51int_khz=667000.
+	 * CONFIG_FB_THREADS=1). Once the GPU was the limit (81% busy, three framebuffers), gestures peaked at 51-60 frames a
+	 * second with them against 47-48 without, the display's copy 5-7.7 ms a frame against 6-9.4 (17 November): asked by
+	 * default now, with the top clocks. a51mif_khz=0, a51int_khz=0 leave them to the firmware.
 	 */
-	uint32_t bus_khz[2] = { 0, 0 };
+	uint32_t bus_khz[2] = { 2093000, 667000 };
 	bool bus_answered[2] = { false, false };
 	PE_parse_boot_argn("a51mif_khz", &bus_khz[0], sizeof(bus_khz[0]));
 	PE_parse_boot_argn("a51int_khz", &bus_khz[1], sizeof(bus_khz[1]));
+	static uint32_t bus_said[2];                    /* (for the watch's line: what was asked, 0 if it went unanswered) */
 	for (uint32_t d = 0; d < 2; d++) {
 		if (bus_khz[d] != 0) {
 			cmd[0] = d;                     /* dm_mif 0, dm_int 1 (dt acpm_dvfs: cal_id 0xb040000, 0xb040001) */
@@ -1625,6 +1628,7 @@ clock_thread(__unused void *parameter, __unused wait_result_t result)
 			cmd[2] = ACPM_FREQ_REQ;
 			cmd[3] = 0;
 			bus_answered[d] = acpm_call(&dvfs, cmd);
+			bus_said[d] = bus_answered[d] ? bus_khz[d] : 0;
 		}
 	}
 	clock_said("step 3: asked the memory interface %u kHz (%s), the internal bus %u kHz (%s)", bus_khz[0],
@@ -1710,10 +1714,10 @@ clock_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 		}
 		if (seconds % 30 == 0) {
-			clock_said("watching: now A53s %u, A73s %u, GPU %u MHz (asked %u, %u, %u); temperatures %d, %d, %d (hottest %d, %d, "
-			    "%d); %u steps down, %u up", levels[0][at[0]] / 1000, levels[1][at[1]] / 1000, levels[2][at[2]] / 1000,
-			    want[0] / 1000, want[1] / 1000, want[2] / 1000, t[1], t[2], t[0], hottest[0], hottest[1], hottest[2], drops,
-			    rises);
+			clock_said("watching: now A53s %u, A73s %u, GPU %u MHz (asked %u, %u, %u); memory %u, bus %u MHz asked and answered "
+			    "(0: not); temperatures %d, %d, %d (hottest %d, %d, %d); %u steps down, %u up", levels[0][at[0]] / 1000,
+			    levels[1][at[1]] / 1000, levels[2][at[2]] / 1000, want[0] / 1000, want[1] / 1000, want[2] / 1000,
+			    bus_said[0] / 1000, bus_said[1] / 1000, t[1], t[2], t[0], hottest[0], hottest[1], hottest[2], drops, rises);
 		}
 	}
 }
