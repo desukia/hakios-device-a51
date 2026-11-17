@@ -731,9 +731,18 @@ HakiosMaliUserClient::createBO(struct drm_panfrost_create_bo * request)
 	return kIOReturnSuccess;
 }
 
+/*
+ * Where a submission's time goes (said with the requests every 30 s): waiting for a surface the display shows, pushing
+ * surfaces and client pages out of the cache (how many bytes), waiting for room in the queue, the rest. Submissions were
+ * 1200-1500 a second at 50-150 us each, 23% of the window server's drawing thread (glprof, 17 November).
+ */
+static uint64_t gSubmitShown, gSubmitFlush, gSubmitRoom, gSubmitAll, gSubmitSurfaceBytes, gSubmitClientBytes;
+static uint32_t gSubmitSurfaces, gSubmitClients, gSubmits, gSubmitShownClean;
+
 IOReturn
 HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 {
+	uint64_t t_began = mach_absolute_time(), t_flush = 0, t_room = 0, t_shown = 0;
 	uint32_t handles[256], fence;
 	uint32_t count = request->bo_handle_count;
 
@@ -771,6 +780,7 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 			shown[i]->release();
 		}
 	}
+	t_shown = mach_absolute_time();
 	IOLockLock(gMaliLock);
 	/*
 	 * The GPU reads and writes memory, not this processor's cache. What the cache holds of an IOSurface goes out of it
@@ -807,12 +817,28 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 			if (b->surface != NULL && flush_surfaces) {
 				uint32_t seed = b->surface->shared()->seed;
 
-				if (seed != b->seed || now_abs - b->pushed >= again) {
+				if (b->surface->shownClean) {
+					/*
+					 * the display's own picture, which only the GPU draws, out of the cache since the display read it
+					 * (MiniIOMobileFramebuffer). Its seed is no sign of a processor's writing: the GL layer moves it at
+					 * every glFlush, two a frame, and the push "again after 4 ms" came once a frame -- for 2 ms of the
+					 * window server's drawing thread each time, 10 MB (surfaces 3 and 5 in turn, 17 November)
+					 */
+					b->seed = seed;
+					if (now_abs - b->pushed >= again) {
+						b->pushed = now_abs;
+						gSubmitShownClean++;
+					}
+				} else if (seed != b->seed || now_abs - b->pushed >= again) {
 					b->seed = seed;
 					b->pushed = now_abs;
 					flush_dcache64((addr64_t)(uintptr_t) b->kernel, (unsigned) b->size, FALSE);
+					gSubmitSurfaces++;
+					gSubmitSurfaceBytes += b->size;
 				}
 			} else if (b->client) {
+				gSubmitClients++;
+				gSubmitClientBytes += b->size;
 				for (uint64_t offset = 0; offset < b->size;) {
 					IOByteCount length = 0;
 					addr64_t phys = b->memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
@@ -829,6 +855,7 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 		done += now;
 	}
 	__asm__ volatile ("dsb sy");
+	t_flush = mach_absolute_time();
 	/*
 	 * A full queue is waited out here: Mesa does not try a refused submission again (panfrost_batch_submit failed: 16,
 	 * and that batch's drawing is lost). Room comes as chains end; five seconds at the most.
@@ -841,6 +868,7 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 		hakios_mali_wait(hakios_mali_completed() + 1, deadline);
 		IOLockLock(gMaliLock);
 	}
+	t_room = mach_absolute_time();
 	if (fence == 0) {
 		IOLockUnlock(gMaliLock);
 		IOLog("HakiosMali: the queue stays full: a submission refused\n");
@@ -865,6 +893,11 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 		}
 		done += now;
 	}
+	gSubmitShown += t_shown - t_began;
+	gSubmitFlush += t_flush - t_shown;
+	gSubmitRoom += t_room - t_flush;
+	gSubmitAll += mach_absolute_time() - t_began;
+	gSubmits++;
 	IOLockUnlock(gMaliLock);
 	request->out_sync = fence;
 	return kIOReturnSuccess;
@@ -950,6 +983,20 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			calls[s] = spent[s] = 0;
 		}
 		printf("HakiosMali: requests in 30 s, by selector:%s\n", line);
+		if (gSubmits != 0) {
+			uint64_t shown, flush, room, all;
+			absolutetime_to_nanoseconds(gSubmitShown, &shown);
+			absolutetime_to_nanoseconds(gSubmitFlush, &flush);
+			absolutetime_to_nanoseconds(gSubmitRoom, &room);
+			absolutetime_to_nanoseconds(gSubmitAll, &all);
+			printf("HakiosMali: submissions in 30 s: %u, us each: %llu in all, %llu waiting for a shown surface, %llu pushing "
+			    "out of the cache, %llu waiting for room; surfaces pushed %u (%llu MB), client buffers %u (%llu MB); not pushed, the "
+			    "display had %u\n", gSubmits,
+			    all / gSubmits / 1000, shown / gSubmits / 1000, flush / gSubmits / 1000, room / gSubmits / 1000, gSubmitSurfaces,
+			    gSubmitSurfaceBytes >> 20, gSubmitClients, gSubmitClientBytes >> 20, gSubmitShownClean);
+			gSubmitShown = gSubmitFlush = gSubmitRoom = gSubmitAll = gSubmitSurfaceBytes = gSubmitClientBytes = 0;
+			gSubmitSurfaces = gSubmitClients = gSubmits = gSubmitShownClean = 0;
+		}
 	}
 	return ret;
 }
