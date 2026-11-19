@@ -3,7 +3,8 @@
 # Patch upstream hakios-xnu-kernel with Samsung Galaxy A51 requirements:
 # 1. Split WIFI_STATION driver in drivers/wifi/conf
 # 2. Update hakios.stubs.c to separate WIFI and WIFI_STATION stubs
-# 3. Add --device support to mkxnuimg.py for Exynos 9611 (A51)
+# 3. Register FB_DECON symbols in configs/symbols.tsv and configs/boot-args.lst
+# 4. Add --device support to mkxnuimg.py for Exynos 9611 (A51)
 # ==============================================================================
 
 set -euo pipefail
@@ -35,8 +36,6 @@ EOF
 
 echo "[*] Aplicando patch em drivers/core/hakios.stubs.c..."
 python3 - << 'PY'
-import sys
-
 path = "drivers/core/hakios.stubs.c"
 with open(path, "r", encoding="utf-8") as f:
     content = f.read()
@@ -67,7 +66,40 @@ if target in content:
         f.write(content)
     print("[✓] hakios.stubs.c atualizado com sucesso!")
 else:
-    print("[!] Trecho já modificado ou diferente em hakios.stubs.c.")
+    print("[!] Trecho em hakios.stubs.c já modificado ou diferente.")
+PY
+
+echo "[*] Registrando símbolos FB_DECON em configs/symbols.tsv e configs/boot-args.lst..."
+python3 - << 'PY'
+tsv_path = "configs/symbols.tsv"
+lst_path = "configs/boot-args.lst"
+
+decon_tsv = [
+    "FB_DECON_TRIG\targ\tfb_decon_trig\tGPU and display\tk\tMiniIOMobileFramebuffer.cpp\thardware DECON trigger",
+    "FB_DECON_DOUBLE\targ\tfb_decon_double\tGPU and display\tk\tMiniIOMobileFramebuffer.cpp\ttwo framebuffers",
+    "FB_DECON_SECOND\thex\tfb_decon_second\tGPU and display\tk\tMiniIOMobileFramebuffer.cpp\tsecond framebuffer address",
+    "FB_DECON_THIRD\thex\tfb_decon_third\tGPU and display\tk\tMiniIOMobileFramebuffer.cpp\tthird framebuffer address",
+]
+
+decon_args = ["fb_decon_trig", "fb_decon_double", "fb_decon_second", "fb_decon_third"]
+
+with open(tsv_path, "r", encoding="utf-8") as f:
+    tsv_content = f.read()
+
+missing_tsv = [line for line in decon_tsv if line.split("\t")[0] not in tsv_content]
+if missing_tsv:
+    with open(tsv_path, "a", encoding="utf-8") as f:
+        f.write("\n" + "\n".join(missing_tsv) + "\n")
+    print(f"[✓] Adicionados {len(missing_tsv)} símbolos em {tsv_path}")
+
+with open(lst_path, "r", encoding="utf-8") as f:
+    lst_content = f.read().splitlines()
+
+missing_args = [arg for arg in decon_args if arg not in lst_content]
+if missing_args:
+    with open(lst_path, "a", encoding="utf-8") as f:
+        f.write("\n" + "\n".join(missing_args) + "\n")
+    print(f"[✓] Adicionados {len(missing_args)} boot-args em {lst_path}")
 PY
 
 echo "[*] Atualizando mkxnuimg.py para suportar --device a51..."

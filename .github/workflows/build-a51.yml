@@ -43,8 +43,10 @@ jobs:
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             device-tree-compiler libssl-dev libelf-dev bc cpio \
             kmod curl wget unzip xz-utils git python3 python3-pip \
-            python3-setuptools python3-wheel 7zip lz4 util-linux
+            python3-setuptools python3-wheel 7zip lz4 util-linux \
+            mono-devel ca-certificates-mono nasm uuid-dev nuget
           pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse
+          echo "CLANGPDB_AARCH64_PREFIX=aarch64-linux-gnu-" >> $GITHUB_ENV
 
       - name: Setup Theos Toolchain and iOS 16.5 SDK
         run: |
@@ -90,16 +92,17 @@ jobs:
         working-directory: hakios-tree
         run: |
           echo "=== Clonando Mu-Silicium (Project-Silicium) ==="
-          git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          git clone --depth 1 --recurse-submodules https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium || git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
           
           echo "=== Copiando arquivos UEFI do A51 para Mu-Silicium ==="
           cp -r devices/a51/uefi/files/* Mu-Silicium/
           
           cd Mu-Silicium
+          export CLANGPDB_AARCH64_PREFIX=aarch64-linux-gnu-
           if [ -f pip-requirements.txt ]; then
             pip3 install --break-system-packages -r pip-requirements.txt || true
           fi
-          python3 build_uefi.py -d a51 || echo "[!] Finalizando passo UEFI..."
+          python3 build_uefi.py -d a51 -u || python3 build_uefi.py -d a51 || echo "[!] Finalizando passo UEFI..."
           cd ..
 
       - name: Configure Defconfig and Compile Kernel & Loader
