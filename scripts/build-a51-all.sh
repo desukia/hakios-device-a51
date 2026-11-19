@@ -32,18 +32,33 @@ fi
 
 # 2. Instalação de dependências (se tiver sudo/apt)
 if command -v apt-get &>/dev/null; then
-    echo -e "${BLUE}[*] Verificando dependências do sistema...${NC}"
+    echo -e "${BLUE}[*] Instalando dependências do sistema...${NC}"
     sudo apt-get update -qq || true
     sudo apt-get install -y --no-install-recommends \
         build-essential clang llvm lld bison flex \
         gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
         device-tree-compiler libssl-dev libelf-dev bc cpio \
         kmod curl wget unzip xz-utils git python3 python3-pip \
-        dmg2img apfs-fuse || true
+        python3-setuptools python3-wheel 7zip lz4 util-linux || true
     pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse || true
 fi
 
-# 3. Preparação do diretório de trabalho
+# 3. Setup do Theos e SDK do iOS 16.5 (se ainda não existir)
+export THEOS="${THEOS:-$HOME/theos}"
+if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ] || [ ! -x "$THEOS/toolchain/linux/iphone/bin/ld" ]; then
+    echo -e "${BLUE}[*] Configurando Theos e SDK iPhoneOS 16.5...${NC}"
+    mkdir -p "$THEOS/toolchain/linux/iphone"
+    curl -LO https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
+    tar -xf linux-ios-arm64e-clang-toolchain.tar.lzma -C "$THEOS/toolchain/linux/iphone/"
+    rm -f linux-ios-arm64e-clang-toolchain.tar.lzma
+
+    git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+    mkdir -p "$THEOS/sdks"
+    cp -r /tmp/theos-sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+    rm -rf /tmp/theos-sdks
+fi
+
+# 4. Preparação do diretório de trabalho
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
 
@@ -56,7 +71,7 @@ fi
 
 cd hakios-xnu-kernel
 
-# 4. Injetar arquivos do dispositivo (hakios-device-a51)
+# 5. Injetar arquivos do dispositivo (hakios-device-a51)
 echo -e "${BLUE}[*] Copiando camada de dispositivo A51 para devices/a51...${NC}"
 mkdir -p devices/a51
 cp -r "${SCRIPT_DIR}/configs" devices/a51/
@@ -68,7 +83,7 @@ cp "${SCRIPT_DIR}/metal.args" devices/a51/
 cp "${SCRIPT_DIR}/PORTING.md" devices/a51/
 cp "${SCRIPT_DIR}/README.md" devices/a51/
 
-# 5. Download do IPSW do iOS 16.5
+# 6. Download do IPSW do iOS 16.5
 if [ ! -f "$IPSW_NAME" ]; then
     echo -e "${BLUE}[*] Baixando IPSW oficial do iOS 16.5 (Build 20F66)...${NC}"
     curl -C - -L -o "$IPSW_NAME" "$IPSW_URL"
@@ -76,30 +91,30 @@ else
     echo -e "${GREEN}[✓] IPSW $IPSW_NAME já baixado.${NC}"
 fi
 
-# 6. Descompactar arquivos de sistema (Userland)
+# 7. Descompactar arquivos de sistema (Userland)
 echo -e "${BLUE}[*] Descompactando imagens APFS do IPSW...${NC}"
 umask 022
 make unpack IPSW="$IPSW_NAME"
 
-# 7. Compilar o UEFI
+# 8. Compilar o UEFI
 echo -e "${BLUE}[*] Compilando Mu-Silicium UEFI para Exynos 9611 / A51...${NC}"
 if [ -f uefi/apply.sh ]; then
     bash uefi/apply.sh a51
 fi
 python3 build_uefi.py -d a51 || echo -e "${YELLOW}[!] Continuando caso UEFI já tenha sido gerado...${NC}"
 
-# 8. Configurar e Compilar Kernel + Loader
+# 9. Configurar e Compilar Kernel + Loader
 echo -e "${BLUE}[*] Configurando e compilando kernel XNU para A51...${NC}"
 make a51_defconfig
 make loader
 make kernel
 
-# 9. Gerar imagem Userland (OpenGL ES Panfrost + Flashboot)
+# 10. Gerar imagem Userland (OpenGL ES Panfrost + Flashboot)
 echo -e "${BLUE}[*] Gerando imagens de inicialização (flashboot.apfs)...${NC}"
 umask 022
 QUIET=1 GL=1 CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh
 
-# 10. Empacotar imagem final para Odin (RECOVERY .tar.md5)
+# 11. Empacotar imagem final para Odin (RECOVERY .tar.md5)
 echo -e "${BLUE}[*] Empacotando imagem de recovery Odin...${NC}"
 mkdir -p out
 if [ -f mkxnuimg.py ]; then

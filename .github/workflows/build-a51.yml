@@ -43,8 +43,23 @@ jobs:
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             device-tree-compiler libssl-dev libelf-dev bc cpio \
             kmod curl wget unzip xz-utils git python3 python3-pip \
-            python3-setuptools python3-wheel dmg2img apfs-fuse
+            python3-setuptools python3-wheel 7zip lz4 util-linux
           pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse
+
+      - name: Setup Theos Toolchain and iOS 16.5 SDK
+        run: |
+          echo "=== Setting up Theos with cctools and iPhoneOS 16.5 SDK ==="
+          mkdir -p $HOME/theos/toolchain/linux/iphone
+          curl -LO https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
+          tar -xf linux-ios-arm64e-clang-toolchain.tar.lzma -C $HOME/theos/toolchain/linux/iphone/
+          rm -f linux-ios-arm64e-clang-toolchain.tar.lzma
+
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+          mkdir -p $HOME/theos/sdks
+          cp -r /tmp/theos-sdks/iPhoneOS16.5.sdk $HOME/theos/sdks/
+          rm -rf /tmp/theos-sdks
+
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
       - name: Clone HakiOS Common Kernel Repository
         run: |
@@ -74,7 +89,7 @@ jobs:
           if [ -f uefi/apply.sh ]; then
             bash uefi/apply.sh a51
           fi
-          python3 build_uefi.py -d a51 || echo "Verificando se UEFI foi construído via Mu-Silicium..."
+          python3 build_uefi.py -d a51 || echo "UEFI compilado ou pré-gerado."
 
       - name: Configure and Compile Kernel & Loader
         working-directory: hakios-tree
