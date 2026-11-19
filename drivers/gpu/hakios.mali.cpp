@@ -749,37 +749,6 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 	if (request->jc == 0 || count > 65536) {
 		return kIOReturnBadArgument;
 	}
-	/*
-	 * Not into a surface the display has yet to copy out, or is copying (MiniIOSurfaceWaitShown): CoreAnimation draws its
-	 * next frame into the one being shown otherwise, and the panel gets it half drawn. 50 ms at the most.
-	 */
-	{
-		MiniIOSurface * shown[8];
-		unsigned found = 0;
-
-		IOLockLock(gMaliLock);
-		for (uint32_t done = 0; done < count && found < 8;) {
-			uint32_t now = count - done > 256 ? 256 : count - done;
-
-			if (copyin((user_addr_t)(request->bo_handles + done * sizeof(uint32_t)), handles, now * sizeof(uint32_t)) != 0) {
-				break;
-			}
-			for (uint32_t i = 0; i < now && found < 8; i++) {
-				struct mali_buffer * b = buffer(handles[i]);
-
-				if (b != NULL && b->surface != NULL && b->surface->displaying != 0) {
-					b->surface->retain();
-					shown[found++] = b->surface;
-				}
-			}
-			done += now;
-		}
-		IOLockUnlock(gMaliLock);
-		for (unsigned i = 0; i < found; i++) {
-			MiniIOSurfaceWaitShown(shown[i], 50);
-			shown[i]->release();
-		}
-	}
 	t_shown = mach_absolute_time();
 	IOLockLock(gMaliLock);
 	/*
@@ -817,19 +786,7 @@ HakiosMaliUserClient::submit(struct drm_panfrost_submit * request)
 			if (b->surface != NULL && flush_surfaces) {
 				uint32_t seed = b->surface->shared()->seed;
 
-				if (b->surface->shownClean) {
-					/*
-					 * the display's own picture, which only the GPU draws, out of the cache since the display read it
-					 * (MiniIOMobileFramebuffer). Its seed is no sign of a processor's writing: the GL layer moves it at
-					 * every glFlush, two a frame, and the push "again after 4 ms" came once a frame -- for 2 ms of the
-					 * window server's drawing thread each time, 10 MB (surfaces 3 and 5 in turn, 17 November)
-					 */
-					b->seed = seed;
-					if (now_abs - b->pushed >= again) {
-						b->pushed = now_abs;
-						gSubmitShownClean++;
-					}
-				} else if (seed != b->seed || now_abs - b->pushed >= again) {
+				if (seed != b->seed || now_abs - b->pushed >= again) {
 					b->seed = seed;
 					b->pushed = now_abs;
 					flush_dcache64((addr64_t)(uintptr_t) b->kernel, (unsigned) b->size, FALSE);
@@ -982,14 +939,14 @@ HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
 			at += (size_t) snprintf(line + at, sizeof(line) - at, " %#x: %llu (%llu us each)", s, n, ns / n / 1000);
 			calls[s] = spent[s] = 0;
 		}
-		printf("HakiosMali: requests in 30 s, by selector:%s\n", line);
+		IOLog("HakiosMali: requests in 30 s, by selector:%s\n", line);
 		if (gSubmits != 0) {
 			uint64_t shown, flush, room, all;
 			absolutetime_to_nanoseconds(gSubmitShown, &shown);
 			absolutetime_to_nanoseconds(gSubmitFlush, &flush);
 			absolutetime_to_nanoseconds(gSubmitRoom, &room);
 			absolutetime_to_nanoseconds(gSubmitAll, &all);
-			printf("HakiosMali: submissions in 30 s: %u, us each: %llu in all, %llu waiting for a shown surface, %llu pushing "
+			IOLog("HakiosMali: submissions in 30 s: %u, us each: %llu in all, %llu waiting for a shown surface, %llu pushing "
 			    "out of the cache, %llu waiting for room; surfaces pushed %u (%llu MB), client buffers %u (%llu MB); not pushed, the "
 			    "display had %u\n", gSubmits,
 			    all / gSubmits / 1000, shown / gSubmits / 1000, flush / gSubmits / 1000, room / gSubmits / 1000, gSubmitSurfaces,

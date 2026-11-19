@@ -34,11 +34,18 @@ driver WIFI
 	help    surface Darwin's wifid talks to. Needs fw-wifi/ from the phone
 EOF
 
-echo "[*] Aplicando patch em drivers/core/hakios.stubs.c..."
+echo "[*] Aplicando patch em drivers/core/hakios.stubs.c e hakios.stubs.cpp..."
 python3 - << 'PY'
-path = "drivers/core/hakios.stubs.c"
-with open(path, "r", encoding="utf-8") as f:
-    content = f.read()
+c_path = "drivers/core/hakios.stubs.c"
+with open(c_path, "r", encoding="utf-8") as f:
+    c_content = f.read()
+
+proto_target = "void HakiosWLANStart(const char *interface, const uint8_t *address);"
+proto_replacement = """void HakiosWLANStart(const char *interface, const uint8_t *address);
+int hakios_wifi_tell(const char *format, ...);"""
+
+if proto_target in c_content and "int hakios_wifi_tell" not in c_content:
+    c_content = c_content.replace(proto_target, proto_replacement)
 
 target = """#ifndef HAKIOS_WIFI
 void hakios_wifi_init(void) {}
@@ -52,7 +59,11 @@ replacement = """#ifndef HAKIOS_WIFI
 void hakios_wifi_init(void) {}
 void hakios_wifi_stop(void) {}
 void hakios_wifi_quiesce(void) {}
-void hakios_wifi_tell(__unused const char *what) {}
+int
+hakios_wifi_tell(__unused const char *format, ...)
+{
+	return 0;
+}
 #endif
 
 #ifndef HAKIOS_WIFI_STATION
@@ -60,13 +71,35 @@ errno_t hakios_apple80211_ioctl(__unused u_long command, __unused void *data) { 
 void HakiosWLANStart(__unused const char *interface, __unused const uint8_t *address) {}
 #endif"""
 
-if target in content:
-    content = content.replace(target, replacement)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    print("[✓] hakios.stubs.c atualizado com sucesso!")
+if target in c_content:
+    c_content = c_content.replace(target, replacement)
+elif "void hakios_wifi_tell" in c_content:
+    # Caso já tenha sido substituído na versão antiga com void
+    old_void = "void hakios_wifi_tell(__unused const char *what) {}"
+    new_int = """int
+hakios_wifi_tell(__unused const char *format, ...)
+{
+	return 0;
+}"""
+    c_content = c_content.replace(old_void, new_int)
+
+with open(c_path, "w", encoding="utf-8") as f:
+    f.write(c_content)
+print("[✓] hakios.stubs.c atualizado com sucesso!")
+
+cpp_path = "drivers/core/hakios.stubs.cpp"
+with open(cpp_path, "r", encoding="utf-8") as f:
+    cpp_content = f.read()
+
+cpp_target = "#ifndef HAKIOS_ADRENO"
+cpp_replacement = "#if !defined(HAKIOS_ADRENO) && !defined(HAKIOS_A51GPU)"
+if cpp_target in cpp_content:
+    cpp_content = cpp_content.replace(cpp_target, cpp_replacement)
+    with open(cpp_path, "w", encoding="utf-8") as f:
+        f.write(cpp_content)
+    print("[✓] hakios.stubs.cpp atualizado com sucesso!")
 else:
-    print("[!] Trecho em hakios.stubs.c já modificado ou diferente.")
+    print("[!] Trecho em hakios.stubs.cpp já modificado ou ausente.")
 PY
 
 echo "[*] Registrando símbolos FB_DECON em configs/symbols.tsv e configs/boot-args.lst..."

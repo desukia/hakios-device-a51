@@ -134,7 +134,16 @@ jobs:
           make loader
           
           echo "=== Compilando kernel XNU para A51 ==="
-          make kernel
+          if ! make kernel; then
+            echo "=== ERRO NA COMPILACAO DO KERNEL ==="
+            if [ -f xnu-build.log ]; then
+              echo "--- Linhas com 'error:' em xnu-build.log ---"
+              grep -E -C 3 "error:" xnu-build.log || true
+              echo "--- Ultimas 100 linhas de xnu-build.log ---"
+              tail -n 100 xnu-build.log
+            fi
+            exit 1
+          fi
 
       - name: Build Flashboot Userland Image
         working-directory: hakios-tree
