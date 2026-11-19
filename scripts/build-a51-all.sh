@@ -33,14 +33,23 @@ fi
 # 2. Instalação de dependências (se tiver sudo/apt)
 if command -v apt-get &>/dev/null; then
     echo -e "${BLUE}[*] Instalando dependências do sistema...${NC}"
+    sudo add-apt-repository -y universe || true
     sudo apt-get update -qq || true
     sudo apt-get install -y --no-install-recommends \
         build-essential clang llvm lld bison flex \
         gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
         device-tree-compiler libssl-dev libelf-dev bc cpio \
         kmod curl wget unzip xz-utils git python3 python3-pip \
-        python3-setuptools python3-wheel 7zip lz4 util-linux || true
+        python3-setuptools python3-wheel 7zip lz4 util-linux \
+        mono-devel ca-certificates-mono nasm uuid-dev \
+        autoconf automake m4 perl || true
     pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse || true
+
+    if ! command -v nuget &>/dev/null; then
+        sudo curl -sSL -o /usr/local/bin/nuget.exe https://dist.nuget.org/win-x86-commandline/latest/nuget.exe
+        printf '#!/bin/sh\nexec mono /usr/local/bin/nuget.exe "$@"\n' | sudo tee /usr/local/bin/nuget
+        sudo chmod +x /usr/local/bin/nuget
+    fi
 fi
 
 # 3. Setup do Theos e SDK do iOS 16.5 (se ainda não existir)
@@ -49,8 +58,13 @@ if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ] || [ ! -x "$THEOS/toolchain/linux/iph
     echo -e "${BLUE}[*] Configurando Theos e SDK iPhoneOS 16.5...${NC}"
     mkdir -p "$THEOS/toolchain/linux/iphone"
     curl -LO https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
-    tar -xf linux-ios-arm64e-clang-toolchain.tar.lzma -C "$THEOS/toolchain/linux/iphone/"
+    tar -xf linux-ios-arm64e-clang-toolchain.tar.lzma -C "$THEOS/toolchain/linux/iphone/" --strip-components=1
     rm -f linux-ios-arm64e-clang-toolchain.tar.lzma
+    chmod +x "$THEOS/toolchain/linux/iphone/bin/"* || true
+
+    if [ -f "$THEOS/toolchain/linux/iphone/bin/ld64" ] && [ ! -f "$THEOS/toolchain/linux/iphone/bin/ld" ]; then
+        ln -sf ld64 "$THEOS/toolchain/linux/iphone/bin/ld"
+    fi
 
     git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
     mkdir -p "$THEOS/sdks"
@@ -89,10 +103,11 @@ bash "${SCRIPT_DIR}/scripts/patch-hakios-for-a51.sh" .
 # 6. Setup do Mu-Silicium e Build do UEFI
 if [ ! -d "Mu-Silicium" ]; then
     echo -e "${BLUE}[*] Clonando Mu-Silicium...${NC}"
-    git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+    git clone --depth 1 --recurse-submodules https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium || git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
     cp -r devices/a51/uefi/files/* Mu-Silicium/
     cd Mu-Silicium
-    python3 build_uefi.py -d a51 || echo -e "${YELLOW}[!] Continuando caso UEFI já tenha sido gerado...${NC}"
+    export CLANGPDB_AARCH64_PREFIX=aarch64-linux-gnu-
+    python3 build_uefi.py -d a51 -u || python3 build_uefi.py -d a51 || echo -e "${YELLOW}[!] Continuando caso UEFI já tenha sido gerado...${NC}"
     cd ..
 fi
 

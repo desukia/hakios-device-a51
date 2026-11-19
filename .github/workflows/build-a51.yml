@@ -45,7 +45,8 @@ jobs:
             device-tree-compiler libssl-dev libelf-dev bc cpio \
             kmod curl wget unzip xz-utils git python3 python3-pip \
             python3-setuptools python3-wheel 7zip lz4 util-linux \
-            mono-devel ca-certificates-mono nasm uuid-dev
+            mono-devel ca-certificates-mono nasm uuid-dev \
+            autoconf automake m4 perl
           pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse
 
           # Setup nuget wrapper com Mono para o Project Mu (necessário no Ubuntu 24.04)
@@ -59,9 +60,20 @@ jobs:
         run: |
           echo "=== Configurando Theos com cctools e SDK iPhoneOS 16.5 ==="
           mkdir -p $HOME/theos/toolchain/linux/iphone
-          curl -LO https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
-          tar -xf linux-ios-arm64e-clang-toolchain.tar.lzma -C $HOME/theos/toolchain/linux/iphone/
-          rm -f linux-ios-arm64e-clang-toolchain.tar.lzma
+          curl -sSL -o /tmp/toolchain.tar.lzma https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
+          
+          # Extrai removendo a pasta raiz ios-arm64e-clang-toolchain/
+          tar -xf /tmp/toolchain.tar.lzma -C $HOME/theos/toolchain/linux/iphone/ --strip-components=1
+          rm -f /tmp/toolchain.tar.lzma
+          chmod +x $HOME/theos/toolchain/linux/iphone/bin/* || true
+
+          # Assegura que o binário 'ld' esteja acessível
+          if [ -f $HOME/theos/toolchain/linux/iphone/bin/ld64 ] && [ ! -f $HOME/theos/toolchain/linux/iphone/bin/ld ]; then
+            ln -sf ld64 $HOME/theos/toolchain/linux/iphone/bin/ld
+          fi
+
+          echo "Verificando binários de cctools em \$THEOS/toolchain/linux/iphone/bin:"
+          ls -la $HOME/theos/toolchain/linux/iphone/bin/
 
           git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
           mkdir -p $HOME/theos/sdks
