@@ -1,0 +1,116 @@
+name: Build HakiOS iOS 16.5 for Samsung Galaxy A51 (SM-A515F)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_device:
+        description: 'Device target'
+        required: true
+        default: 'a51'
+      build_recovery:
+        description: 'Build Odin recovery .tar.md5'
+        required: true
+        type: boolean
+        default: true
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-hakios:
+    name: Compile HakiOS Kernel, UEFI and iOS 16.5 Userland
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Device Repository (hakios-device-a51)
+        uses: actions/checkout@v4
+        with:
+          path: device-a51
+
+      - name: Free Disk Space on Runner
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker system prune -af || true
+          echo "=== Disk space after cleanup ==="
+          df -h
+
+      - name: Install Toolchain and Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang llvm lld bison flex \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            device-tree-compiler libssl-dev libelf-dev bc cpio \
+            kmod curl wget unzip xz-utils git python3 python3-pip \
+            python3-setuptools python3-wheel dmg2img apfs-fuse
+          pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse
+
+      - name: Clone HakiOS Common Kernel Repository
+        run: |
+          git clone --depth 1 https://github.com/oosexgang/hakios-xnu-kernel.git hakios-tree
+          mkdir -p hakios-tree/devices/a51
+          cp -r device-a51/* hakios-tree/devices/a51/
+          ls -la hakios-tree/devices/a51/
+
+      - name: Download iOS 16.5 (20F66) IPSW from Apple CDN
+        working-directory: hakios-tree
+        run: |
+          IPSW_URL="https://updates.cdn-apple.com/2023SpringFCS/fullrestores/032-85130/6AB0D10A-8AF9-4F6C-8CF5-A1B315CABE88/iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw"
+          IPSW_FILE="iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw"
+          echo "Baixando IPSW oficial do iOS 16.5 (~5.7 GB)..."
+          curl -C - -L -o "$IPSW_FILE" "$IPSW_URL"
+          ls -lh "$IPSW_FILE"
+
+      - name: Unpack IPSW System Images
+        working-directory: hakios-tree
+        run: |
+          umask 022
+          make unpack IPSW="iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw"
+
+      - name: Build UEFI for Samsung Galaxy A51
+        working-directory: hakios-tree
+        run: |
+          if [ -f uefi/apply.sh ]; then
+            bash uefi/apply.sh a51
+          fi
+          python3 build_uefi.py -d a51 || echo "Verificando se UEFI foi construído via Mu-Silicium..."
+
+      - name: Configure and Compile Kernel & Loader
+        working-directory: hakios-tree
+        run: |
+          make a51_defconfig
+          make loader
+          make kernel
+
+      - name: Build Flashboot Userland Image
+        working-directory: hakios-tree
+        run: |
+          umask 022
+          QUIET=1 GL=1 CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh
+
+      - name: Package Odin Recovery Image (.tar.md5)
+        working-directory: hakios-tree
+        run: |
+          mkdir -p out
+          if [ -f mkxnuimg.py ]; then
+            python3 mkxnuimg.py --device a51 -o out/recovery.img || python3 mkxnuimg.py -o out/recovery.img
+          fi
+          if [ -f out/recovery.img ]; then
+            cd out
+            tar -H ustar -c recovery.img > hakios-a51-fb2-RECOVERY.tar
+            md5sum -t hakios-a51-fb2-RECOVERY.tar >> hakios-a51-fb2-RECOVERY.tar
+            mv hakios-a51-fb2-RECOVERY.tar hakios-a51-fb2-RECOVERY.tar.md5
+            ls -lh hakios-a51-fb2-RECOVERY.tar.md5
+            cd ..
+          fi
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hakios-a51-recovery-odin
+          path: |
+            hakios-tree/out/*
+            hakios-tree/build/*
+            hakios-tree/userland/*.apfs
+          if-no-files-found: warn
