@@ -28,11 +28,11 @@ jobs:
 
       - name: Free Disk Space on Runner
         run: |
-          echo "=== Disk space before cleanup ==="
+          echo "=== Espaço em disco antes da limpeza ==="
           df -h
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           sudo docker system prune -af || true
-          echo "=== Disk space after cleanup ==="
+          echo "=== Espaço em disco após limpeza ==="
           df -h
 
       - name: Install Toolchain and Build Dependencies
@@ -48,7 +48,7 @@ jobs:
 
       - name: Setup Theos Toolchain and iOS 16.5 SDK
         run: |
-          echo "=== Setting up Theos with cctools and iPhoneOS 16.5 SDK ==="
+          echo "=== Configurando Theos com cctools e SDK iPhoneOS 16.5 ==="
           mkdir -p $HOME/theos/toolchain/linux/iphone
           curl -LO https://github.com/sbingner/llvm-project/releases/latest/download/linux-ios-arm64e-clang-toolchain.tar.lzma
           tar -xf linux-ios-arm64e-clang-toolchain.tar.lzma -C $HOME/theos/toolchain/linux/iphone/
@@ -61,12 +61,15 @@ jobs:
 
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Clone HakiOS Common Kernel Repository
+      - name: Clone HakiOS Common Repository and Integrate A51
         run: |
           git clone --depth 1 https://github.com/oosexgang/hakios-xnu-kernel.git hakios-tree
           mkdir -p hakios-tree/devices/a51
           cp -r device-a51/* hakios-tree/devices/a51/
-          ls -la hakios-tree/devices/a51/
+          
+          echo "=== Aplicando patches necessários para Galaxy A51 ==="
+          chmod +x device-a51/scripts/patch-hakios-for-a51.sh
+          bash device-a51/scripts/patch-hakios-for-a51.sh hakios-tree
 
       - name: Download iOS 16.5 (20F66) IPSW from Apple CDN
         working-directory: hakios-tree
@@ -83,19 +86,32 @@ jobs:
           umask 022
           make unpack IPSW="iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw"
 
-      - name: Build UEFI for Samsung Galaxy A51
+      - name: Setup Mu-Silicium and Build UEFI for Galaxy A51
         working-directory: hakios-tree
         run: |
-          if [ -f uefi/apply.sh ]; then
-            bash uefi/apply.sh a51
+          echo "=== Clonando Mu-Silicium (Project-Silicium) ==="
+          git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          
+          echo "=== Copiando arquivos UEFI do A51 para Mu-Silicium ==="
+          cp -r devices/a51/uefi/files/* Mu-Silicium/
+          
+          cd Mu-Silicium
+          if [ -f pip-requirements.txt ]; then
+            pip3 install --break-system-packages -r pip-requirements.txt || true
           fi
-          python3 build_uefi.py -d a51 || echo "UEFI compilado ou pré-gerado."
+          python3 build_uefi.py -d a51 || echo "[!] Finalizando passo UEFI..."
+          cd ..
 
-      - name: Configure and Compile Kernel & Loader
+      - name: Configure Defconfig and Compile Kernel & Loader
         working-directory: hakios-tree
         run: |
+          echo "=== Configurando defconfig a51 ==="
           make a51_defconfig
+          
+          echo "=== Compilando xnuloader ==="
           make loader
+          
+          echo "=== Compilando kernel XNU para A51 ==="
           make kernel
 
       - name: Build Flashboot Userland Image
@@ -108,9 +124,8 @@ jobs:
         working-directory: hakios-tree
         run: |
           mkdir -p out
-          if [ -f mkxnuimg.py ]; then
-            python3 mkxnuimg.py --device a51 -o out/recovery.img || python3 mkxnuimg.py -o out/recovery.img
-          fi
+          python3 mkxnuimg.py --device a51 -o out/recovery.img
+          
           if [ -f out/recovery.img ]; then
             cd out
             tar -H ustar -c recovery.img > hakios-a51-fb2-RECOVERY.tar

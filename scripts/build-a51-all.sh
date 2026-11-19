@@ -71,7 +71,7 @@ fi
 
 cd hakios-xnu-kernel
 
-# 5. Injetar arquivos do dispositivo (hakios-device-a51)
+# 5. Injetar arquivos do dispositivo (hakios-device-a51) e aplicar patches
 echo -e "${BLUE}[*] Copiando camada de dispositivo A51 para devices/a51...${NC}"
 mkdir -p devices/a51
 cp -r "${SCRIPT_DIR}/configs" devices/a51/
@@ -83,7 +83,20 @@ cp "${SCRIPT_DIR}/metal.args" devices/a51/
 cp "${SCRIPT_DIR}/PORTING.md" devices/a51/
 cp "${SCRIPT_DIR}/README.md" devices/a51/
 
-# 6. Download do IPSW do iOS 16.5
+echo -e "${BLUE}[*] Aplicando patches do A51 (WIFI_STATION e mkxnuimg)...${NC}"
+bash "${SCRIPT_DIR}/scripts/patch-hakios-for-a51.sh" .
+
+# 6. Setup do Mu-Silicium e Build do UEFI
+if [ ! -d "Mu-Silicium" ]; then
+    echo -e "${BLUE}[*] Clonando Mu-Silicium...${NC}"
+    git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+    cp -r devices/a51/uefi/files/* Mu-Silicium/
+    cd Mu-Silicium
+    python3 build_uefi.py -d a51 || echo -e "${YELLOW}[!] Continuando caso UEFI já tenha sido gerado...${NC}"
+    cd ..
+fi
+
+# 7. Download do IPSW do iOS 16.5
 if [ ! -f "$IPSW_NAME" ]; then
     echo -e "${BLUE}[*] Baixando IPSW oficial do iOS 16.5 (Build 20F66)...${NC}"
     curl -C - -L -o "$IPSW_NAME" "$IPSW_URL"
@@ -91,17 +104,10 @@ else
     echo -e "${GREEN}[✓] IPSW $IPSW_NAME já baixado.${NC}"
 fi
 
-# 7. Descompactar arquivos de sistema (Userland)
+# 8. Descompactar arquivos de sistema (Userland)
 echo -e "${BLUE}[*] Descompactando imagens APFS do IPSW...${NC}"
 umask 022
 make unpack IPSW="$IPSW_NAME"
-
-# 8. Compilar o UEFI
-echo -e "${BLUE}[*] Compilando Mu-Silicium UEFI para Exynos 9611 / A51...${NC}"
-if [ -f uefi/apply.sh ]; then
-    bash uefi/apply.sh a51
-fi
-python3 build_uefi.py -d a51 || echo -e "${YELLOW}[!] Continuando caso UEFI já tenha sido gerado...${NC}"
 
 # 9. Configurar e Compilar Kernel + Loader
 echo -e "${BLUE}[*] Configurando e compilando kernel XNU para A51...${NC}"
@@ -117,9 +123,7 @@ QUIET=1 GL=1 CRYPTEXES=flash FLASHBOOT=1 REST=1 userland/build.sh
 # 11. Empacotar imagem final para Odin (RECOVERY .tar.md5)
 echo -e "${BLUE}[*] Empacotando imagem de recovery Odin...${NC}"
 mkdir -p out
-if [ -f mkxnuimg.py ]; then
-    python3 mkxnuimg.py --device a51 -o out/recovery.img || python3 mkxnuimg.py -o out/recovery.img
-fi
+python3 mkxnuimg.py --device a51 -o out/recovery.img
 
 if [ -f out/recovery.img ]; then
     cd out
