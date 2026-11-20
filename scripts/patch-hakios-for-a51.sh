@@ -304,6 +304,42 @@ for p in "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/dsymutil" "xnu-deps/h
     chmod +x "$p" 2>/dev/null || true
 done
 
+echo "[*] Substituindo cctools strip por stub seguro (copy-based)..."
+cat << 'STRIPEOF' > /tmp/strip-stub.sh
+#!/bin/bash
+# Stub strip: cctools strip can't parse the cross-compiled ARM64 kernel Mach-O.
+# This stub simply copies input to output, preserving the unstripped binary.
+in=""; out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -*) shift ;;
+        *) [ -z "$in" ] && in="$1"; shift ;;
+    esac
+done
+if [ -n "$in" ] && [ -n "$out" ]; then
+    cp "$in" "$out"
+elif [ -n "$in" ]; then
+    : # strip in-place requested but we do nothing (preserve file)
+fi
+exit 0
+STRIPEOF
+chmod +x /tmp/strip-stub.sh
+
+for s in "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/strip" "xnu-deps/host/bin/strip"; do
+    if [ -f "$s" ] || [ -L "$s" ]; then
+        rm -f "$s"
+        cp /tmp/strip-stub.sh "$s"
+        chmod +x "$s"
+        echo "[✓] strip stub instalado em: $s"
+    else
+        mkdir -p "$(dirname "$s")" 2>/dev/null || true
+        cp /tmp/strip-stub.sh "$s"
+        chmod +x "$s"
+        echo "[✓] strip stub criado em: $s"
+    fi
+done
+
 echo "[✓] Todos os patches para Galaxy A51 aplicados com sucesso!"
 
 

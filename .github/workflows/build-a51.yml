@@ -194,6 +194,16 @@ jobs:
           fi
           sed -i 's/DO_CTFMERGE=0/DO_CTFMERGE=0 BUILD_DSYM=0/' xnu-build.sh || true
           
+          echo "=== Substituindo cctools strip por stub (cópia segura) ==="
+          printf '#!/bin/bash\nin=""; out=""\nwhile [ $# -gt 0 ]; do\n  case "$1" in -o) out="$2"; shift 2 ;; -*) shift ;; *) [ -z "$in" ] && in="$1"; shift ;; esac\ndone\n[ -n "$in" ] && [ -n "$out" ] && cp "$in" "$out"\nexit 0\n' > /tmp/strip-stub.sh
+          chmod +x /tmp/strip-stub.sh
+          for s in xnu-deps/host/bin/strip "$HOME/theos/toolchain/linux/iphone/bin/strip"; do
+            rm -f "$s" 2>/dev/null || true
+            mkdir -p "$(dirname "$s")" 2>/dev/null || true
+            cp /tmp/strip-stub.sh "$s"
+            chmod +x "$s"
+          done
+          
           echo "=== Compilando kernel XNU para A51 ==="
           if ! make kernel BUILD_DSYM=0; then
             echo "=== ERRO NA COMPILACAO DO KERNEL ==="
