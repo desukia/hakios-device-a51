@@ -151,10 +151,17 @@ jobs:
           echo "=== Compilando xnuloader ==="
           make loader
           
+          echo "=== Preparando dependencias e fontes do kernel XNU ==="
+          [ -d xnu-src/xnu-8796.121.2 ] || xnu/apply.sh
+          
+          echo "=== Aplicando patch no ld64 em todas as localizações ==="
+          for bin in "$HOME/theos/toolchain/linux/iphone/bin/ld" "$HOME/theos/toolchain/linux/iphone/bin/ld64" "xnu-deps/host/bin/ld" "xnu-deps/host/bin/ld64"; do
+            if [ -f "$bin" ]; then
+              python3 ../device-a51/scripts/patch-ld64.py "$bin" || true
+            fi
+          done
+          
           echo "=== Compilando kernel XNU para A51 ==="
-          if [ -f xnu-deps/host/bin/ld64 ]; then
-            python3 ../device-a51/scripts/patch-ld64.py xnu-deps/host/bin/ld64 || true
-          fi
           if ! make kernel; then
             echo "=== ERRO NA COMPILACAO DO KERNEL ==="
             if [ -f xnu-build.log ]; then
@@ -176,7 +183,13 @@ jobs:
         working-directory: hakios-tree
         run: |
           mkdir -p out
-          python3 mkxnuimg.py --device a51 -o out/recovery.img
+          PAYLOAD_ARG=""
+          if [ -f hakios-kernel ] && head -c 4 hakios-kernel | grep -q XNUP; then
+            PAYLOAD_ARG="-p hakios-kernel"
+          elif [ -f build/hakios-kernel ] && head -c 4 build/hakios-kernel | grep -q XNUP; then
+            PAYLOAD_ARG="-p build/hakios-kernel"
+          fi
+          python3 mkxnuimg.py --device a51 $PAYLOAD_ARG -o out/recovery.img
           
           if [ -f out/recovery.img ]; then
             cd out
@@ -194,5 +207,7 @@ jobs:
           path: |
             hakios-tree/out/*
             hakios-tree/build/*
+            hakios-tree/hakios-kernel
+            hakios-tree/loader.efi
             hakios-tree/userland/*.apfs
           if-no-files-found: warn

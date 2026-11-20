@@ -254,11 +254,10 @@ fi
 
 if [ -n "$PATCH_PY" ]; then
     chmod +x "$PATCH_PY"
-    if [ -d "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin" ]; then
-        python3 "$PATCH_PY" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld64" || true
-    fi
-    if [ -f "xnu-deps/host/bin/ld64" ]; then
-        python3 "$PATCH_PY" "xnu-deps/host/bin/ld64" || true
-    fi
+    for bin in "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld64" "xnu-deps/host/bin/ld" "xnu-deps/host/bin/ld64"; do
+        if [ -f "$bin" ]; then
+            python3 "$PATCH_PY" "$bin" || true
+        fi
+    done
 fi
 
