@@ -9,6 +9,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="${1:-.}"
 cd "$TARGET_DIR"
 
@@ -244,14 +245,20 @@ chmod +x mkxnuimg.py
 echo "[✓] mkxnuimg.py atualizado com sucesso!"
 
 echo "[*] Aplicando patch no ld64 / cctools se presente..."
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PATCH_PY=""
 if [ -f "$SCRIPT_DIR/patch-ld64.py" ]; then
-    chmod +x "$SCRIPT_DIR/patch-ld64.py"
+    PATCH_PY="$SCRIPT_DIR/patch-ld64.py"
+elif [ -f "devices/a51/scripts/patch-ld64.py" ]; then
+    PATCH_PY="devices/a51/scripts/patch-ld64.py"
+fi
+
+if [ -n "$PATCH_PY" ]; then
+    chmod +x "$PATCH_PY"
     if [ -d "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin" ]; then
-        python3 "$SCRIPT_DIR/patch-ld64.py" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld64" || true
+        python3 "$PATCH_PY" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld64" || true
     fi
     if [ -f "xnu-deps/host/bin/ld64" ]; then
-        python3 "$SCRIPT_DIR/patch-ld64.py" "xnu-deps/host/bin/ld64" || true
+        python3 "$PATCH_PY" "xnu-deps/host/bin/ld64" || true
     fi
 fi
 
