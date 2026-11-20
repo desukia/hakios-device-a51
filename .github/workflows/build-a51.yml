@@ -276,14 +276,24 @@ jobs:
             cd ..
           fi
 
-      - name: Upload Build Artifacts
+      - name: Upload Odin Recovery Package (.tar.md5)
         uses: actions/upload-artifact@v4
         with:
           name: hakios-a51-recovery-odin
           path: |
-            hakios-tree/out/*
-            hakios-tree/build/*
+            hakios-tree/out/*.tar.md5
+          if-no-files-found: warn
+
+      - name: Upload Kernel, UEFI and System Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: hakios-a51-system-binaries
+          path: |
+            hakios-tree/out/recovery.img
+            hakios-tree/out/SILICIUM_UEFI.fd
+            hakios-tree/out/payload.bin
             hakios-tree/hakios-kernel
             hakios-tree/loader.efi
             hakios-tree/userland/*.apfs
+            hakios-tree/build/*
           if-no-files-found: warn
