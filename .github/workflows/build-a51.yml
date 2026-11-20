@@ -134,24 +134,41 @@ jobs:
       - name: Setup Mu-Silicium and Build UEFI for Galaxy A51
         working-directory: hakios-tree
         run: |
-          echo "=== Clonando Mu-Silicium (Project-Silicium) ==="
+          echo "=== Clonando repositório HakiOS UEFI (speedyg2200/hakios-uefi branch a51-port) ==="
+          rm -rf uefi
+          git clone --depth 1 --branch a51-port https://github.com/speedyg2200/hakios-uefi.git uefi
+          
+          echo "=== Clonando Mu-Silicium (Project-Silicium) no commit base $(cat uefi/BASE) ==="
           rm -rf Mu-Silicium
           git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          BASE_COMMIT=$(cat uefi/BASE)
+          if ! git -C Mu-Silicium fetch --depth 1 origin "$BASE_COMMIT" 2>/dev/null; then
+            git -C Mu-Silicium fetch --unshallow || git -C Mu-Silicium fetch origin || true
+          fi
+          git -C Mu-Silicium checkout -q "$BASE_COMMIT"
           
           cd Mu-Silicium
           echo "=== Configurando submódulos de forma segura ==="
-          # Desativa Silicium-ACPI nas configs do git para evitar o erro de commit inexistente na árvore
           git config submodule.Silicium-ACPI.update none || true
-          
-          # Clona Silicium-ACPI diretamente da branch principal
           git clone --depth 1 https://github.com/Project-Silicium/Silicium-ACPI.git Silicium-ACPI || true
           
-          # Inicializa submódulos essenciais de forma rasa e não-recursiva
           git submodule update --init --depth 1 Binaries || true
           git submodule update --init --depth 1 Common/Mu || true
           git submodule update --init --depth 1 Common/Mu_OEM_Sample || true
           git submodule update --init --depth 1 Mu_Basecore || true
           git submodule update --init --depth 1 Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl || true
+          
+          echo "=== Aplicando hakios.patch e arquivos do HakiOS ==="
+          git apply --whitespace=nowarn ../uefi/hakios.patch
+          cp -r ../uefi/files/. .
+          python3 ../uefi/branding/banner.py Silicon/Silicium/SiliciumPkg/Include/Resources
+          
+          echo "=== Configurando mu_nasm extdep com nasm do sistema ==="
+          D="Mu_Basecore/BaseTools/Bin/mu_nasm_extdep"
+          mkdir -p "$D/Linux-x86-64"
+          echo 'version: 20016.1.1' > "$D/extdep_state.yaml"
+          ln -sf /usr/bin/nasm "$D/Linux-x86-64/nasm"
+          ln -sf /usr/bin/ndisasm "$D/Linux-x86-64/ndisasm"
           
           cd ..
           echo "=== Copiando arquivos UEFI do A51 para Mu-Silicium ==="
@@ -234,6 +251,14 @@ jobs:
               PAYLOAD_ARG="-p out/payload.bin"
             fi
           fi
+          
+          echo "=== Preservando SILICIUM_UEFI.fd em out/ ==="
+          for fd in Mu-Silicium/Build/a51Pkg/*/FV/SILICIUM_UEFI.fd; do
+            if [ -f "$fd" ]; then
+              cp "$fd" out/SILICIUM_UEFI.fd || true
+              break
+            fi
+          done
           
           echo "=== Gerando recovery.img com mkxnuimg.py ==="
           python3 mkxnuimg.py --device a51 $PAYLOAD_ARG -o out/recovery.img || python3 mkxnuimg.py --device a51 -o out/recovery.img || true
