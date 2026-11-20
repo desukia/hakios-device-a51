@@ -75,16 +75,23 @@ jobs:
           rm -f /tmp/toolchain.tar.lzma
           chmod +x $HOME/theos/toolchain/linux/iphone/bin/* || true
 
-          # Assegura que o binário 'ld' esteja acessível
-          if [ -f $HOME/theos/toolchain/linux/iphone/bin/ld64 ] && [ ! -f $HOME/theos/toolchain/linux/iphone/bin/ld ]; then
+          # Assegura que ambos os binários 'ld' e 'ld64' estejam acessíveis
+          if [ -f $HOME/theos/toolchain/linux/iphone/bin/ld ] && [ ! -f $HOME/theos/toolchain/linux/iphone/bin/ld64 ]; then
+            ln -sf ld $HOME/theos/toolchain/linux/iphone/bin/ld64
+          elif [ -f $HOME/theos/toolchain/linux/iphone/bin/ld64 ] && [ ! -f $HOME/theos/toolchain/linux/iphone/bin/ld ]; then
             ln -sf ld64 $HOME/theos/toolchain/linux/iphone/bin/ld
           fi
+
+          echo "=== Neutralizando asserções indevidas em ld64 (typeLastSection, typeFirstSection, typeTempLTO) ==="
+          chmod +x device-a51/scripts/patch-ld64.py
+          python3 device-a51/scripts/patch-ld64.py $HOME/theos/toolchain/linux/iphone/bin/ld
 
           echo "Verificando binários de cctools em \$THEOS/toolchain/linux/iphone/bin:"
           ls -la $HOME/theos/toolchain/linux/iphone/bin/
 
           echo "Testando dependencias de bibliotecas do ld64:"
           ldd $HOME/theos/toolchain/linux/iphone/bin/ld64 || true
+          $HOME/theos/toolchain/linux/iphone/bin/ld64 -v || true
 
           git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
           mkdir -p $HOME/theos/sdks
@@ -145,6 +152,9 @@ jobs:
           make loader
           
           echo "=== Compilando kernel XNU para A51 ==="
+          if [ -f xnu-deps/host/bin/ld64 ]; then
+            python3 ../device-a51/scripts/patch-ld64.py xnu-deps/host/bin/ld64 || true
+          fi
           if ! make kernel; then
             echo "=== ERRO NA COMPILACAO DO KERNEL ==="
             if [ -f xnu-build.log ]; then

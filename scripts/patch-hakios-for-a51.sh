@@ -242,3 +242,16 @@ finally:
 EOF
 chmod +x mkxnuimg.py
 echo "[✓] mkxnuimg.py atualizado com sucesso!"
+
+echo "[*] Aplicando patch no ld64 / cctools se presente..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$SCRIPT_DIR/patch-ld64.py" ]; then
+    chmod +x "$SCRIPT_DIR/patch-ld64.py"
+    if [ -d "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin" ]; then
+        python3 "$SCRIPT_DIR/patch-ld64.py" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld" "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ld64" || true
+    fi
+    if [ -f "xnu-deps/host/bin/ld64" ]; then
+        python3 "$SCRIPT_DIR/patch-ld64.py" "xnu-deps/host/bin/ld64" || true
+    fi
+fi
+

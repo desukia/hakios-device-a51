@@ -72,8 +72,14 @@ if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk" ] || [ ! -x "$THEOS/toolchain/linux/iph
     rm -f linux-ios-arm64e-clang-toolchain.tar.lzma
     chmod +x "$THEOS/toolchain/linux/iphone/bin/"* || true
 
-    if [ -f "$THEOS/toolchain/linux/iphone/bin/ld64" ] && [ ! -f "$THEOS/toolchain/linux/iphone/bin/ld" ]; then
+    if [ -f "$THEOS/toolchain/linux/iphone/bin/ld" ] && [ ! -f "$THEOS/toolchain/linux/iphone/bin/ld64" ]; then
+        ln -sf ld "$THEOS/toolchain/linux/iphone/bin/ld64"
+    elif [ -f "$THEOS/toolchain/linux/iphone/bin/ld64" ] && [ ! -f "$THEOS/toolchain/linux/iphone/bin/ld" ]; then
         ln -sf ld64 "$THEOS/toolchain/linux/iphone/bin/ld"
+    fi
+
+    if [ -f "${SCRIPT_DIR}/scripts/patch-ld64.py" ]; then
+        python3 "${SCRIPT_DIR}/scripts/patch-ld64.py" "$THEOS/toolchain/linux/iphone/bin/ld" || true
     fi
 
     git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
