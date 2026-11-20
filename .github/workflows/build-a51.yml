@@ -108,7 +108,8 @@ jobs:
 
       - name: Clone HakiOS Common Repository and Integrate A51
         run: |
-          git clone --depth 1 https://github.com/oosexgang/hakios-xnu-kernel.git hakios-tree
+          echo "=== Clonando repositório HakiOS XNU Kernel (speedyg2200/hakios-xnu-kernel branch a51-port) ==="
+          git clone --depth 1 --branch a51-port https://github.com/speedyg2200/hakios-xnu-kernel.git hakios-tree
           mkdir -p hakios-tree/devices/a51
           cp -r device-a51/* hakios-tree/devices/a51/
           
@@ -183,6 +184,9 @@ jobs:
           echo "=== Compilando UEFI do A51 com build_uefi.py ==="
           python3 build_uefi.py -d a51 || echo "[!] Aviso: Finalizando passo UEFI (continuando fluxo)..."
           cd ..
+          
+          mkdir -p Mu-Silicium/Resources
+          touch Mu-Silicium/Resources/ramdisk
 
       - name: Configure Defconfig and Compile Kernel & Loader
         working-directory: hakios-tree
