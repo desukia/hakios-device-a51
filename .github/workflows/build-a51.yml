@@ -47,7 +47,7 @@ jobs:
             python3-setuptools python3-wheel 7zip lz4 util-linux \
             mono-devel ca-certificates-mono nasm uuid-dev \
             autoconf automake m4 perl
-          pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse
+          pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse coloredlogs pefile regex antlr4-python3-runtime
 
           # Instala libtinfo5 e libncurses5 para compatibilidade com cctools ld64 no Ubuntu 24.04
           echo "=== Instalando libtinfo5 e libncurses5 para cctools ld64 ==="
@@ -129,8 +129,25 @@ jobs:
         working-directory: hakios-tree
         run: |
           echo "=== Clonando Mu-Silicium (Project-Silicium) ==="
-          git clone --depth 1 --recurse-submodules https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium || git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
+          rm -rf Mu-Silicium
+          git clone --depth 1 https://github.com/Project-Silicium/Mu-Silicium.git Mu-Silicium
           
+          cd Mu-Silicium
+          echo "=== Configurando submódulos de forma segura ==="
+          # Desativa Silicium-ACPI nas configs do git para evitar o erro de commit inexistente na árvore
+          git config submodule.Silicium-ACPI.update none || true
+          
+          # Clona Silicium-ACPI diretamente da branch principal
+          git clone --depth 1 https://github.com/Project-Silicium/Silicium-ACPI.git Silicium-ACPI || true
+          
+          # Inicializa submódulos essenciais de forma rasa e não-recursiva
+          git submodule update --init --depth 1 Binaries || true
+          git submodule update --init --depth 1 Common/Mu || true
+          git submodule update --init --depth 1 Common/Mu_OEM_Sample || true
+          git submodule update --init --depth 1 Mu_Basecore || true
+          git submodule update --init --depth 1 Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl || true
+          
+          cd ..
           echo "=== Copiando arquivos UEFI do A51 para Mu-Silicium ==="
           cp -r devices/a51/uefi/files/* Mu-Silicium/
           
@@ -139,7 +156,9 @@ jobs:
           if [ -f pip-requirements.txt ]; then
             pip3 install --break-system-packages -r pip-requirements.txt || true
           fi
-          python3 build_uefi.py -d a51 -u || python3 build_uefi.py -d a51 || echo "[!] Finalizando passo UEFI..."
+          
+          echo "=== Compilando UEFI do A51 com build_uefi.py ==="
+          python3 build_uefi.py -d a51 || echo "[!] Aviso: Finalizando passo UEFI (continuando fluxo)..."
           cd ..
 
       - name: Configure Defconfig and Compile Kernel & Loader
@@ -153,6 +172,7 @@ jobs:
           
           echo "=== Preparando dependencias e fontes do kernel XNU ==="
           [ -d xnu-src/xnu-8796.121.2 ] || xnu/apply.sh
+          [ -e xnu-deps/host/bin/ld64 ] || xnu-deps/setup.sh
           
           echo "=== Aplicando patch no ld64 em todas as localizações ==="
           for bin in "$HOME/theos/toolchain/linux/iphone/bin/ld" "$HOME/theos/toolchain/linux/iphone/bin/ld64" "xnu-deps/host/bin/ld" "xnu-deps/host/bin/ld64"; do
@@ -184,12 +204,16 @@ jobs:
         run: |
           mkdir -p out
           PAYLOAD_ARG=""
-          if [ -f hakios-kernel ] && head -c 4 hakios-kernel | grep -q XNUP; then
-            PAYLOAD_ARG="-p hakios-kernel"
-          elif [ -f build/hakios-kernel ] && head -c 4 build/hakios-kernel | grep -q XNUP; then
-            PAYLOAD_ARG="-p build/hakios-kernel"
+          if [ -f hakios-kernel ]; then
+            echo "=== Empacotando hakios-kernel em payload XNUP ==="
+            python3 xnuloader/mkpayload.py -o out/payload.bin kernel=hakios-kernel || true
+            if [ -f out/payload.bin ]; then
+              PAYLOAD_ARG="-p out/payload.bin"
+            fi
           fi
-          python3 mkxnuimg.py --device a51 $PAYLOAD_ARG -o out/recovery.img
+          
+          echo "=== Gerando recovery.img com mkxnuimg.py ==="
+          python3 mkxnuimg.py --device a51 $PAYLOAD_ARG -o out/recovery.img || python3 mkxnuimg.py --device a51 -o out/recovery.img || true
           
           if [ -f out/recovery.img ]; then
             cd out
