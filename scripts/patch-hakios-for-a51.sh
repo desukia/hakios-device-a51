@@ -261,3 +261,45 @@ if [ -n "$PATCH_PY" ]; then
     done
 fi
 
+echo "[*] Desativando geração de dSYM no xnu-build.sh (BUILD_DSYM=0)..."
+if [ -f "xnu-build.sh" ]; then
+    sed -i 's/DO_CTFMERGE=0/DO_CTFMERGE=0 BUILD_DSYM=0/' xnu-build.sh || true
+    echo "[✓] xnu-build.sh atualizado com BUILD_DSYM=0"
+fi
+
+echo "[*] Configurando stub para dsymutil..."
+cat << 'EOF' > /tmp/dsymutil-stub.sh
+#!/bin/bash
+target=""
+while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+        target="$2"
+        shift 2
+        continue
+    fi
+    shift
+done
+if [ -n "$target" ]; then
+    mkdir -p "$target/Contents/Resources/DWARF"
+    touch "$target/Contents/Resources/DWARF/$(basename "$target" .dSYM)"
+    touch "$target"
+fi
+exit 0
+EOF
+chmod +x /tmp/dsymutil-stub.sh
+
+if [ -w /usr/local/bin ]; then
+    cp /tmp/dsymutil-stub.sh /usr/local/bin/dsymutil
+    chmod +x /usr/local/bin/dsymutil
+elif command -v sudo >/dev/null 2>&1; then
+    sudo cp /tmp/dsymutil-stub.sh /usr/local/bin/dsymutil || true
+    sudo chmod +x /usr/local/bin/dsymutil || true
+fi
+
+for p in "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/dsymutil" "xnu-deps/host/bin/dsymutil"; do
+    mkdir -p "$(dirname "$p")"
+    cp /tmp/dsymutil-stub.sh "$p" || true
+    chmod +x "$p" || true
+done
+
+

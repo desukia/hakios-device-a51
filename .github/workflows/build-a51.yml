@@ -46,7 +46,7 @@ jobs:
             kmod curl wget unzip xz-utils git python3 python3-pip \
             python3-setuptools python3-wheel 7zip lz4 util-linux \
             mono-devel ca-certificates-mono nasm uuid-dev \
-            autoconf automake m4 perl
+            autoconf automake m4 perl meson ninja-build python3-venv
           pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse coloredlogs pefile regex antlr4-python3-runtime
 
           # Instala libtinfo5 e libncurses5 para compatibilidade com cctools ld64 no Ubuntu 24.04
@@ -85,6 +85,12 @@ jobs:
           echo "=== Neutralizando asserções indevidas em ld64 (typeLastSection, typeFirstSection, typeTempLTO) ==="
           chmod +x device-a51/scripts/patch-ld64.py
           python3 device-a51/scripts/patch-ld64.py $HOME/theos/toolchain/linux/iphone/bin/ld
+
+          echo "=== Criando stub seguro do dsymutil para evitar falha no Linux ==="
+          printf '#!/bin/bash\ntarget=""\nwhile [ $# -gt 0 ]; do\n  if [ "$1" = "-o" ]; then target="$2"; shift 2; continue; fi\n  shift\ndone\nif [ -n "$target" ]; then\n  mkdir -p "$target/Contents/Resources/DWARF"\n  touch "$target/Contents/Resources/DWARF/$(basename "$target" .dSYM)"\n  touch "$target"\nfi\nexit 0\n' | sudo tee /usr/local/bin/dsymutil > /dev/null
+          sudo chmod +x /usr/local/bin/dsymutil
+          cp /usr/local/bin/dsymutil $HOME/theos/toolchain/linux/iphone/bin/dsymutil
+          chmod +x $HOME/theos/toolchain/linux/iphone/bin/dsymutil
 
           echo "Verificando binários de cctools em \$THEOS/toolchain/linux/iphone/bin:"
           ls -la $HOME/theos/toolchain/linux/iphone/bin/
@@ -181,8 +187,15 @@ jobs:
             fi
           done
           
+          echo "=== Configurando BUILD_DSYM=0 e stub do dsymutil ==="
+          if [ -d xnu-deps/host/bin ]; then
+            cp /usr/local/bin/dsymutil xnu-deps/host/bin/dsymutil || true
+            chmod +x xnu-deps/host/bin/dsymutil || true
+          fi
+          sed -i 's/DO_CTFMERGE=0/DO_CTFMERGE=0 BUILD_DSYM=0/' xnu-build.sh || true
+          
           echo "=== Compilando kernel XNU para A51 ==="
-          if ! make kernel; then
+          if ! make kernel BUILD_DSYM=0; then
             echo "=== ERRO NA COMPILACAO DO KERNEL ==="
             if [ -f xnu-build.log ]; then
               echo "--- Linhas com 'error:' em xnu-build.log ---"
