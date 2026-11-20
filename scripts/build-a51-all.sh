@@ -45,6 +45,16 @@ if command -v apt-get &>/dev/null; then
         autoconf automake m4 perl || true
     pip3 install --break-system-packages edk2-pytool-extensions edk2-pytool-library lzfse || true
 
+    # Instala libtinfo5 e libncurses5 para ld64 (Ubuntu 24.04)
+    if [ ! -f /usr/lib/x86_64-linux-gnu/libtinfo.so.5 ]; then
+        echo -e "${BLUE}[*] Instalando pacotes libtinfo5 e libncurses5...${NC}"
+        curl -sSL -o /tmp/libtinfo5.deb http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2ubuntu0.3_amd64.deb || true
+        curl -sSL -o /tmp/libncurses5.deb http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libncurses5_6.3-2ubuntu0.3_amd64.deb || true
+        sudo dpkg -i /tmp/libtinfo5.deb /tmp/libncurses5.deb || sudo apt-get install -f -y || true
+        rm -f /tmp/libtinfo5.deb /tmp/libncurses5.deb
+        sudo ldconfig || true
+    fi
+
     if ! command -v nuget &>/dev/null; then
         sudo curl -sSL -o /usr/local/bin/nuget.exe https://dist.nuget.org/win-x86-commandline/latest/nuget.exe
         printf '#!/bin/sh\nexec mono /usr/local/bin/nuget.exe "$@"\n' | sudo tee /usr/local/bin/nuget
