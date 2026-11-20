@@ -288,18 +288,22 @@ exit 0
 EOF
 chmod +x /tmp/dsymutil-stub.sh
 
-if [ -w /usr/local/bin ]; then
-    cp /tmp/dsymutil-stub.sh /usr/local/bin/dsymutil
-    chmod +x /usr/local/bin/dsymutil
+if [ -f /usr/local/bin/dsymutil ]; then
+    echo "[✓] /usr/local/bin/dsymutil já configurado."
 elif command -v sudo >/dev/null 2>&1; then
-    sudo cp /tmp/dsymutil-stub.sh /usr/local/bin/dsymutil || true
-    sudo chmod +x /usr/local/bin/dsymutil || true
+    sudo cp -f /tmp/dsymutil-stub.sh /usr/local/bin/dsymutil 2>/dev/null || true
+    sudo chmod +x /usr/local/bin/dsymutil 2>/dev/null || true
+elif [ -w /usr/local/bin ]; then
+    cp -f /tmp/dsymutil-stub.sh /usr/local/bin/dsymutil 2>/dev/null || true
+    chmod +x /usr/local/bin/dsymutil 2>/dev/null || true
 fi
 
 for p in "${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/dsymutil" "xnu-deps/host/bin/dsymutil"; do
-    mkdir -p "$(dirname "$p")"
-    cp /tmp/dsymutil-stub.sh "$p" || true
-    chmod +x "$p" || true
+    mkdir -p "$(dirname "$p")" 2>/dev/null || true
+    cp -f /tmp/dsymutil-stub.sh "$p" 2>/dev/null || true
+    chmod +x "$p" 2>/dev/null || true
 done
+
+echo "[✓] Todos os patches para Galaxy A51 aplicados com sucesso!"
 
 
